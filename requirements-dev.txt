@@ -1,0 +1,10 @@
+# Local (no-GPU) development: chunkers + eval logic, WITHOUT sentence-transformers/torch.
+# The test suite uses bench.py's deterministic 'fake' embedder.
+langchain-text-splitters==1.1.2
+chonkie==1.7.0
+llama-index-core==0.14.23
+tiktoken>=0.7.0
+huggingface_hub>=0.23.0
+numpy>=2.0.0
+pandas>=2.0
+tabulate>=0.9

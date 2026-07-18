@@ -1,0 +1,12 @@
+# Pinned for Colab free tier (checked for mutual compatibility 2026-07).
+# torch is deliberately ABSENT: Colab preinstalls a CUDA torch build and
+# sentence-transformers only requires torch>=1.11, so the resolver leaves it alone.
+langchain-text-splitters==1.1.2
+chonkie==1.7.0
+llama-index-core==0.14.23
+sentence-transformers==5.6.0
+tiktoken>=0.7.0
+huggingface_hub>=0.23.0
+numpy>=2.0.0
+pandas>=2.0
+tabulate>=0.9
