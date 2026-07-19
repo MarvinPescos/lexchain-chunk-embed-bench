@@ -2,4 +2,6 @@ __pycache__/
 *.pyc
 data/
 .cache_bench/
+.cache_summ/
+summarization/.cache_summ/
 .venv*/

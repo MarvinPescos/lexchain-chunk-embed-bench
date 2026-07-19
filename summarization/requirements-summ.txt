@@ -1,0 +1,10 @@
+# Summarization comparison deps. On Colab, torch is preinstalled (bert-score
+# uses it) — do NOT reinstall torch. nltk punkt/punkt_tab are fetched in-notebook.
+sumy==0.11.0
+nltk>=3.9
+rouge-score>=0.1.2
+bert-score>=0.3.13
+openai>=1.40
+pandas>=2.0
+tabulate>=0.9
+numpy>=1.24
