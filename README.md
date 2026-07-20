@@ -45,41 +45,33 @@ python tests/run_tests.py             # chunkers, matching, metrics, resume logi
 
 Tests use a deterministic bag-of-words `fake` embedder, so the whole pipeline runs on CPU in seconds.
 
-## RAG generation benchmark (justify the LLM choice)
-
-A second, downstream experiment: freeze the retrieval pipeline to this benchmark's winners (**LangChain splitter + e5-base-v2**, reusing the cached embeddings) and vary **only the generation LLM**. For each of the 1,142 Law QAs: retrieve top-k chunks, prompt the model with OHR-Bench's exact QA prompt, and score the answer with **OHR-Bench's own generation metric** (`ohr_gen_eval.py`, vendored):
-
-- **OHR-Bench F1** (headline) — token-overlap F1 after normalization (lowercase, strip punctuation/articles). Yes/No/"noanswer" answers must match exactly or score 0.
-- **Accuracy (EM)** — strict normalized equality; `acc_contains` (gold ⊆ prediction) reported as a forgiving supplement.
-- Answer-format notes: brief answers wrapped in `<response>…</response>`, `"Not answerable"` abstention, punctuation stripping means numeric answers match on digit-strings. Metrics count all questions incl. table/formula/chart evidence (a real RAG miss counts against the model).
-
-**Provider: Groq** (`GROQ_API_KEY`). Models are the durable post-Llama set — `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `qwen/qwen3.6-27b` — because Groq's Llama 3.1/3.3 are EOL Aug 16 2026 (Llama 3.1 70B already removed). The runner **checkpoints after every question** and handles rate limits: a per-minute 429 backs off and retries; a daily-limit 429 stops cleanly so the same command resumes the next day. Free-tier 70B-class caps (~100–200K tokens/day) make a **stratified ~200 sample** the practical default — the smoke cell prints paid cost and free-tier calendar-day projections for both full and sample before you commit.
-
-Run `rag_gen_bench.ipynb` on Colab: smoke (8×3) + projection → approve → `rag_generate.py --sample 200` (resumable) → `gen_aggregate.py`. Outputs to Drive: `gen_results_table.md` (model | F1 | accuracy | latency | cost/1k, winner marked as the system result), `gen_matrix.csv`, and `human_review.csv` (per-answer auto scores + blank `human_correct`, ~40 rows flagged `spot_check`). After the team fills it, `gen_aggregate.py --with-human <csv>` reports auto-vs-human agreement + Cohen's κ.
-
-```bash
-python tests/run_gen_tests.py   # scoring, sampling, retrieval, resume, backoff, aggregate — no API/torch
-```
-
-## Summarization comparison (justify the abstractive choice)
-
-A third experiment ([`summarization/`](summarization/README.md)) compares three summarization approaches for LexChain's document-analysis component — TextRank, LexRank (both `sumy`), and Llama 3.1 70B via **NVIDIA NIM** — on a seeded 13-doc OHR-Bench Law sample. Two-layer evaluation: automated **proxy** metrics (ROUGE / BERTScore vs source, loudly flagged since extractive inflates ROUGE) and a **blind human-evaluation scaffold** (per-doc randomized variant labels + a separate unblinding key) that is the primary basis for the conclusion. Driver: `summarization/summ_compare.ipynb`.
-
 ## Layout
 
 ```
 download_data.py     OHR-Bench GT (law) + law QA pairs
 chunkers.py          3 chunker adapters + char-span → page attribution
 matching.py          vendored OHR-Bench normalize/lcs_score + doc+page gate
-bench.py             resumable chunk×embed matrix runner (Drive-cached stages)
+bench.py             resumable matrix runner (Drive-cached stages)
 aggregate.py         CSV + paper tables + interaction-effect flags
-chunk_embed_bench.ipynb  Colab driver (chunk×embed)
-ohr_gen_eval.py      vendored OHR-Bench generation scoring (F1/EM) + QA prompt
-groq_client.py       Groq client: rate-limit-aware backoff, daily-limit handling
-rag_generate.py      resumable generation runner (fixed pipeline, vary LLM)
-gen_estimate.py      full-run time/cost projection from the smoke test
-gen_aggregate.py     model table + winner + human-review CSV + agreement
-rag_gen_bench.ipynb  Colab driver (generation)
-summarization/       summarization comparison (extractive vs LLM) — see its README
-tests/               CPU-only test suites (run_tests.py, run_gen_tests.py)
+chunk_embed_bench.ipynb  Colab driver
+tests/run_tests.py   CPU-only test suite
 ```
+
+## LLM document-analysis comparison (`analysis/`)
+
+A separate, human-judged experiment: compare **3 LLMs from different families** on LexChain's document-analysis task — one fixed prompt asking for a **summary + entities (parties/dates/monetary_amounts/obligations) + risk_flags** as JSON — over a deterministic 10-doc Law sample (seed 42). Provider: **NVIDIA NIM** (OpenAI-compatible, one provider). Models: `meta/llama-3.1-70b-instruct` (deployed) vs `qwen/qwen2.5-72b-instruct` vs `mistralai/mixtral-8x22b-instruct-v0.1`; IDs validated against the live `/v1/models` catalog at startup.
+
+The deliverable is a **blind human-scoring scaffold**, not just auto-metrics:
+
+```
+analysis/analyze.py            resumable runner (checkpoint per doc×model, backoff, /v1/models validation)
+analysis/prompt.py             the single fixed prompt + JSON schema + robust parser
+analysis/build_blind_eval.py   blind_eval.csv (30 rows, identities hidden as Output A/B/C, seed 42),
+                               unblinding_key.csv, ground_truth_key_template.csv
+analysis/matching_entities.py  fuzzy entity/risk matching (org-suffix aware) for P/R/F1
+analysis/aggregate_analysis.py un-blind → results.md: model | coverage | accuracy | fluency | entity F1 | risk F1
+analysis_compare.ipynb         Colab driver (secret NVIDIA_API_KEY; 6-call smoke → 30-call full run)
+analysis/tests/run_tests.py    CPU-only, fake deterministic LLM (no key, no network)
+```
+
+Run `analysis_compare.ipynb` on Colab (add `NVIDIA_API_KEY` to Colab Secrets — no GPU needed). Rate the blind sheet and fill `ground_truth_key.csv` before running the aggregate cell. Local test: `python analysis/tests/run_tests.py`.

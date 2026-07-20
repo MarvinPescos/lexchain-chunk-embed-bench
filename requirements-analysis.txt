@@ -1,0 +1,7 @@
+# LLM document-analysis comparison (analysis/). Colab-friendly; no torch needed.
+openai>=1.40
+pandas>=2.0
+rapidfuzz>=3.0
+tabulate>=0.9
+tqdm>=4.64
+huggingface_hub>=0.23.0
