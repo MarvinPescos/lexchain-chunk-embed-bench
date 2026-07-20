@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .data import load_docs
 from .prompt import ENTITY_CATEGORIES
+from .prepare_ground_truth import write_ground_truth_template
 
 BLIND_SEED = 42
 LABELS = ["Output A", "Output B", "Output C"]
@@ -37,8 +38,6 @@ HUMAN_COLS = [
     "hallucinations_notes",
     "overall_notes",
 ]
-
-GT_KEY_COLS = ["parties", "dates", "monetary_amounts", "obligations", "risk_clauses"]
 
 
 def _fmt_entities(entities: dict) -> str:
@@ -113,14 +112,9 @@ def build(cache_dir: Path) -> tuple[int, int]:
         w.writeheader()
         w.writerows(sorted(key_rows, key=lambda r: r["presentation_id"]))
 
-    gt_path = cache_dir / "ground_truth_key_template.csv"
-    with open(gt_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["doc_reference", "source_text"] + GT_KEY_COLS)
-        w.writeheader()
-        for doc in sorted(analyses):
-            w.writerow({"doc_reference": doc,
-                        "source_text": docs_text.get(doc, "")[:8000],
-                        **{c: "" for c in GT_KEY_COLS}})
+    # blank hand-authored ground-truth template (same canonical writer as
+    # prepare_ground_truth.py, so the two never drift)
+    write_ground_truth_template(cache_dir, {doc: docs_text.get(doc, "") for doc in sorted(analyses)})
 
     return len(blind_rows), len(key_rows)
 

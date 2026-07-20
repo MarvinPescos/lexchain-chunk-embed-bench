@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO))
 from analysis.prompt import build_messages, parse_analysis, normalize_analysis  # noqa: E402
 from analysis.matching_entities import score_category  # noqa: E402
 from analysis.analyze import run_analyses  # noqa: E402
-from analysis import build_blind_eval, aggregate_analysis  # noqa: E402
+from analysis import build_blind_eval, aggregate_analysis, prepare_ground_truth  # noqa: E402
 
 PASS = 0
 
@@ -64,6 +64,34 @@ def test_matching():
     check("money numeric match", s["tp"] == 1, str(s))
     s = score_category("parties", [], ["Acme"])
     check("all missed -> recall 0", s["tp"] == 0 and s["fn"] == 1 and s["f1"] == 0.0)
+
+
+def test_prepare_ground_truth():
+    print("prepare_ground_truth: blank template + readable dumps")
+    tmp = Path(tempfile.mkdtemp(prefix="an_"))
+    try:
+        docs = {"doc_alpha": "PARTY ONE and PARTY TWO agree. " * 20,
+                "doc_beta": "Effective 2021-01-01. Fee is $500."}
+        tmpl = prepare_ground_truth.write_ground_truth_template(tmp, docs)
+        rows = list(csv.DictReader(open(tmpl)))
+        check("template one blank row per doc", len(rows) == 2, str(len(rows)))
+        check("template cols = doc_reference + 5 gt cols",
+              list(rows[0].keys()) == ["doc_reference"] + prepare_ground_truth.GT_KEY_COLS,
+              str(list(rows[0].keys())))
+        check("template gt cells are blank",
+              all(r[c] == "" for r in rows for c in prepare_ground_truth.GT_KEY_COLS))
+        check("template cols == aggregator's GT_LIST_COLS",
+              prepare_ground_truth.GT_KEY_COLS == aggregate_analysis.GT_LIST_COLS)
+        check("instructions file written", (tmp / "ground_truth_key_INSTRUCTIONS.txt").exists())
+
+        dumps = prepare_ground_truth.write_doc_dumps(tmp, docs)
+        check("one dump per doc", len(dumps) == 2, str(len(dumps)))
+        check("index written", (tmp / "doc_texts" / "INDEX.txt").exists())
+        body = dumps[0].read_text()
+        check("dump has header + source text", "ground-truth authoring dump" in body
+              and "PARTY ONE" in body)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _fake_call_fn(model_id, messages):
@@ -179,6 +207,7 @@ def test_blind_and_aggregate(monkeypatch_docs=True):
 if __name__ == "__main__":
     test_prompt_parsing()
     test_matching()
+    test_prepare_ground_truth()
     test_runner_resume()
     test_blind_and_aggregate()
     print(f"\nALL {PASS} CHECKS PASSED")
