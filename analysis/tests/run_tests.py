@@ -22,9 +22,11 @@ from analysis.prompt import (  # noqa: E402
     strip_thinking,
     validate_schema,
 )
+import types  # noqa: E402
+
 from analysis.data import EXCLUDED_MODELS, MODELS, REFERENCE_ROLE, context_check  # noqa: E402
 from analysis.matching_entities import score_category  # noqa: E402
-from analysis.analyze import assert_vram, run_analyses  # noqa: E402
+from analysis.analyze import assert_vram, make_call_fn, run_analyses  # noqa: E402
 from analysis import aggregate_analysis, build_blind_eval, prepare_ground_truth  # noqa: E402
 
 PASS = 0
@@ -85,6 +87,15 @@ def test_prompt_parsing():
     fenced = "```json\n" + good + "\n```"
     check("parses fenced json", parse_analysis(fenced) is not None)
     check("unparseable -> None", parse_analysis("not json") is None)
+
+    # widened parser: preamble + fenced JSON + trailing prose (small-model shape)
+    messy = "Here is the analysis you requested:\n```json\n" + good + "\n```\nLet me know!"
+    check("parses preamble+fence+trailing prose", parse_analysis(messy) is not None)
+    # trailing commas (common small-model quirk) repaired
+    trailing = '{"summary":"S","entities":{"parties":["A",],"dates":[],' \
+               '"monetary_amounts":[],"obligations":[],},"risk_flags":[]}'
+    p2 = parse_analysis(trailing)
+    check("repairs trailing commas", p2 is not None and p2["entities"]["parties"] == ["A"])
 
     # normalization: missing/misordered categories get realigned; extras dropped
     partial = _good_obj()
@@ -183,6 +194,81 @@ def _fake_call_fn(short, messages):
     if short == "qwen3-14b":  # simulate thinking-mode leakage
         raw = "<think>step by step...</think>" + raw
     return raw, {"completion_tokens": 42}, 0.5 if short != "llama-3.1-70b" else 2.0
+
+
+class _StubClient:
+    """Records the kwargs passed to chat.completions.create."""
+    def __init__(self, content='{"x":1}'):
+        self.captured = None
+        self._content = content
+        self.chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        self.captured = kwargs
+        msg = types.SimpleNamespace(content=self._content)
+        usage = types.SimpleNamespace(prompt_tokens=10, completion_tokens=20)
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)],
+                                     usage=usage)
+
+
+def test_ollama_json_format():
+    print("ollama backend requests constrained JSON; nim does not")
+    ollama, nim = _StubClient(), _StubClient()
+    call_fn = make_call_fn({"ollama": ollama, "nim": nim})
+    call_fn("llama3.1-8b", [{"role": "user", "content": "hi"}])
+    check("ollama gets response_format json_object",
+          ollama.captured["response_format"] == {"type": "json_object"})
+    check("ollama sets num_ctx",
+          ollama.captured["extra_body"]["options"]["num_ctx"] == 32768)
+    call_fn("llama-3.1-70b", [{"role": "user", "content": "hi"}])
+    check("nim reference has no response_format constraint",
+          "response_format" not in nim.captured)
+
+
+def test_reference_tolerant():
+    print("reference failure is caught (candidates still complete); retryable")
+    tmp = Path(tempfile.mkdtemp(prefix="an_"))
+    try:
+        docs = {"doc_a": "t"}
+
+        def fn_ref_fails(short, messages):
+            if MODELS[short]["role"] != "candidate":
+                raise RuntimeError("403 Authorization failed")
+            return _fake_call_fn(short, messages)
+
+        run_analyses(docs, ALL_MODELS, tmp, fn_ref_fails)  # must NOT raise
+        cand_ok = [json.loads((tmp / "analyses" / f"doc_a__{m}.json").read_text())["ok"]
+                   for m in CANDIDATES]
+        check("four candidates completed", all(cand_ok) and len(cand_ok) == 4)
+        ref = json.loads((tmp / "analyses" / "doc_a__llama-3.1-70b.json").read_text())
+        check("reference recorded ok:false + call_failed + error",
+              ref["ok"] is False and ref["call_failed"] and "403" in ref["error"])
+
+        # resume RE-ATTEMPTS the failed reference; candidates are skipped
+        calls = []
+        def fn_all_ok(short, messages):
+            calls.append(short)
+            return _fake_call_fn(short, messages)
+        run_analyses(docs, ALL_MODELS, tmp, fn_all_ok)
+        check("resume retries only the failed reference", calls == ["llama-3.1-70b"],
+              str(calls))
+        ref2 = json.loads((tmp / "analyses" / "doc_a__llama-3.1-70b.json").read_text())
+        check("reference now succeeds on rerun", ref2["ok"] and not ref2["call_failed"])
+
+        # a CANDIDATE hard failure must still fail loudly (abort)
+        def fn_cand_fails(short, messages):
+            if short == "gemma3-12b":
+                raise RuntimeError("ollama server died")
+            return _fake_call_fn(short, messages)
+        raised = False
+        try:
+            run_analyses({"doc_b": "t"}, ALL_MODELS, tmp, fn_cand_fails)
+        except RuntimeError:
+            raised = True
+        check("candidate failure aborts the run", raised)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_runner_resume():
@@ -288,6 +374,8 @@ if __name__ == "__main__":
     test_prompt_parsing()
     test_matching()
     test_context_check()
+    test_ollama_json_format()
+    test_reference_tolerant()
     test_prepare_ground_truth()
     test_runner_resume()
     test_blind_gate_and_aggregate()

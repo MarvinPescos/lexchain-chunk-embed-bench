@@ -113,8 +113,21 @@ def strip_thinking(text: str) -> str:
     return text.strip()
 
 
+_FENCE_ANY = re.compile(r"```(?:json)?", re.IGNORECASE)
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
 def _strip_fences(text: str) -> str:
     return _FENCE.sub("", text.strip())
+
+
+def _repair_json(text: str) -> str:
+    """Best-effort cleanup for small-model JSON quirks (only used as a fallback
+    when strict parsing fails): remove markdown fences anywhere and trailing
+    commas before } or ]. Safe on already-valid JSON."""
+    text = _FENCE_ANY.sub("", text)
+    text = _TRAILING_COMMA.sub(r"\1", text)
+    return text.strip()
 
 
 def _first_json_object(text: str) -> str | None:
@@ -206,11 +219,25 @@ def validate_schema(parsed: dict) -> list[str]:
 
 def parse_analysis(text: str) -> dict | None:
     """Parse a model response into the canonical schema, or None if unparseable.
-    Tries: think-stripped, direct json, fence-stripped, first balanced object."""
+
+    Tries, in order of increasing aggressiveness: think-stripped raw, fence-
+    stripped, first balanced {...} object, then repaired variants of each
+    (fences removed anywhere + trailing commas dropped)."""
     text = strip_thinking(text)
-    for candidate in (text, _strip_fences(text), _first_json_object(text) or ""):
-        if not candidate:
+    candidates: list[str] = []
+    for base in (text, _strip_fences(text)):
+        candidates.append(base)
+        inner = _first_json_object(base)
+        if inner:
+            candidates.append(inner)
+    candidates += [_repair_json(c) for c in list(candidates)]
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate or candidate in seen:
             continue
+        seen.add(candidate)
         try:
             obj = json.loads(candidate)
             if isinstance(obj, dict):

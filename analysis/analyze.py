@@ -180,6 +180,9 @@ def collect_models_meta(cache_dir: Path, short_names: list[str]) -> dict:
             "temperature": TEMPERATURE,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "prompt_version": PROMPT_VERSION,
+            "json_decoding": ("response_format=json_object (constrained)"
+                              if spec["backend"] == "ollama"
+                              else "unconstrained (prompt-only)"),
             "recorded_at": now_iso(),
         }
         if spec["backend"] == "ollama":
@@ -203,9 +206,14 @@ def make_call_fn(clients: dict):
             temperature=TEMPERATURE,
             max_tokens=MAX_OUTPUT_TOKENS,
         )
-        if spec["backend"] == "ollama" and spec["num_ctx"]:
-            # explicit context so Ollama never silently truncates at its default
-            kwargs["extra_body"] = {"options": {"num_ctx": spec["num_ctx"]}}
+        if spec["backend"] == "ollama":
+            # constrained JSON decoding so small models emit syntactically valid
+            # JSON (fixes e.g. llama3.1:8b markdown/preamble); the prompt already
+            # contains "JSON" as required by json_object mode.
+            kwargs["response_format"] = {"type": "json_object"}
+            if spec["num_ctx"]:
+                # explicit context so Ollama never silently truncates at its default
+                kwargs["extra_body"] = {"options": {"num_ctx": spec["num_ctx"]}}
         last_err = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -252,42 +260,67 @@ def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
         messages = build_messages(text)
         for short in short_names:
             spec = MODELS[short]
+            is_reference = spec["role"] != "candidate"
             i += 1
             path = out_dir / f"{stem}__{short}.json"
             if resume and path.exists():
-                log(f"[{i}/{total}] {stem[:40]} x {short}: cached, skip")
-                written.append(path)
-                continue
-            log(f"[{i}/{total}] {stem[:40]} x {short}: calling {spec['id']} ...")
+                prev = json.loads(path.read_text(encoding="utf-8"))
+                # skip completed work (success OR deterministic parse failure);
+                # RE-ATTEMPT only transport failures (e.g. reference 403) so a
+                # fixed credential is picked up on rerun.
+                if not prev.get("call_failed"):
+                    log(f"[{i}/{total}] {stem[:40]} x {short}: cached, skip")
+                    written.append(path)
+                    continue
+                log(f"[{i}/{total}] {stem[:40]} x {short}: retrying previously-failed call")
+            else:
+                log(f"[{i}/{total}] {stem[:40]} x {short}: calling {spec['id']} ...")
 
-            raw, usage, latency = "", {}, None
-            parsed, problems = None, ["not called"]
-            for attempt in range(1 + PARSE_RETRIES):
-                raw, usage, latency = call_fn(short, messages)
-                parsed = parse_analysis(raw)  # strips <think> blocks internally
-                problems = validate_schema(parsed) if parsed else ["unparseable JSON"]
-                if not problems:
-                    break
-                _log_raw_failure(cache_dir, stem, short, attempt, raw, problems)
-                log(f"    parse/schema attempt {attempt+1} failed: {problems[:2]}")
-                time.sleep(min(2 ** attempt, 10))
-
-            atomic_write_json(path, {
+            base_rec = {
                 "doc": stem, "model": short, "model_id": spec["id"],
                 "backend": spec["backend"], "role": spec["role"],
                 "prompt_version": PROMPT_VERSION,
                 "temperature": TEMPERATURE, "num_ctx": spec["num_ctx"],
                 "strip_think": bool(spec.get("strip_think")),
-                "raw": raw, "parsed": parsed,
-                "ok": parsed is not None and not problems,
-                "schema_problems": problems if problems else [],
-                "latency_s": round(latency, 3) if latency is not None else None,
-                "latency_label": latency_label,
-                "usage": usage, "ts": now_iso(),
-            })
-            status = "ok" if (parsed and not problems) else f"PROBLEMS {problems[:1]}"
-            log(f"    -> {status} ({latency:.1f}s, "
-                f"{usage.get('completion_tokens', '?')} out tok)")
+                "latency_label": latency_label, "ts": now_iso(),
+            }
+            try:
+                raw, usage, latency = "", {}, None
+                parsed, problems = None, ["not called"]
+                for attempt in range(1 + PARSE_RETRIES):
+                    raw, usage, latency = call_fn(short, messages)
+                    parsed = parse_analysis(raw)  # strips <think> blocks internally
+                    problems = validate_schema(parsed) if parsed else ["unparseable JSON"]
+                    if not problems:
+                        break
+                    _log_raw_failure(cache_dir, stem, short, attempt, raw, problems)
+                    log(f"    parse/schema attempt {attempt+1} failed: {problems[:2]}")
+                    time.sleep(min(2 ** attempt, 10))
+                atomic_write_json(path, {
+                    **base_rec, "raw": raw, "parsed": parsed,
+                    "ok": parsed is not None and not problems,
+                    "call_failed": False,
+                    "schema_problems": problems if problems else [],
+                    "latency_s": round(latency, 3) if latency is not None else None,
+                    "usage": usage,
+                })
+                status = "ok" if (parsed and not problems) else f"PROBLEMS {problems[:1]}"
+                log(f"    -> {status} ({latency:.1f}s, "
+                    f"{usage.get('completion_tokens', '?')} out tok)")
+            except Exception as e:
+                # A candidate failing hard is a real problem -> fail loudly.
+                # The reference (non-deployable) must not abort the run: record
+                # the failure and continue with the four candidates.
+                if not is_reference:
+                    raise
+                atomic_write_json(path, {
+                    **base_rec, "raw": "", "parsed": None, "ok": False,
+                    "call_failed": True, "error": f"{type(e).__name__}: {e}",
+                    "schema_problems": ["call failed"],
+                    "latency_s": None, "usage": {},
+                })
+                log(f"    -> REFERENCE CALL FAILED ({type(e).__name__}); recorded "
+                    f"ok:false and continuing. Fix access and rerun to retry it.")
             written.append(path)
     return written
 
