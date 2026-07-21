@@ -59,7 +59,7 @@ tests/run_tests.py   CPU-only test suite
 
 ## LLM document-analysis comparison (`analysis/`)
 
-A separate, human-judged experiment: compare **3 LLMs from different families** on LexChain's document-analysis task — one fixed prompt asking for a **summary + entities (parties/dates/monetary_amounts/obligations) + risk_flags** as JSON — over a deterministic 10-doc Law sample (seed 42). Provider: **NVIDIA NIM** (OpenAI-compatible, one provider). Models: `meta/llama-3.1-70b-instruct` (deployed) vs `qwen/qwen2.5-72b-instruct` vs `mistralai/mixtral-8x22b-instruct-v0.1`; IDs validated against the live `/v1/models` catalog at startup.
+A separate, human-judged experiment: compare **3 LLMs from different families** on LexChain's document-analysis task — one fixed prompt asking for a **summary + entities (parties/dates/monetary_amounts/obligations) + risk_flags** as JSON — over a deterministic 10-doc Law sample (seed 42). Provider: **NVIDIA NIM** (OpenAI-compatible, one provider). Models: `meta/llama-3.1-70b-instruct` (deployed, 70B dense) vs `qwen/qwen3-next-80b-a3b-instruct` (80B MoE, ~3B active/token) vs `mistralai/mistral-large-2-instruct` (123B dense); IDs validated against the live `/v1/models` catalog at startup. (Comparators re-selected 2026-07-21 after NVIDIA retired Qwen2.5-72B and Mixtral-8x22B-instruct; tier/recency asymmetries are documented as paper limitations.)
 
 The deliverable is a **blind human-scoring scaffold**, not just auto-metrics:
 

@@ -116,7 +116,7 @@ def test_runner_resume():
     try:
         docs = {"doc_a": "text a", "doc_b": "text b"}
         models = {"llama-3.1-70b": "meta/llama-3.1-70b-instruct",
-                  "qwen2.5-72b": "qwen/qwen2.5-72b-instruct"}
+                  "qwen3-next-80b": "qwen/qwen3-next-80b-a3b-instruct"}
         run_analyses(docs, models, tmp, _fake_call_fn)
         files = list((tmp / "analyses").glob("*.json"))
         check("4 checkpoints written", len(files) == 4, str(len(files)))
@@ -140,8 +140,8 @@ def test_blind_and_aggregate(monkeypatch_docs=True):
         # 2 docs x 3 models fake analyses
         docs = {"doc_alpha": "t", "doc_beta": "t"}
         models = {"llama-3.1-70b": "meta/llama-3.1-70b-instruct",
-                  "qwen2.5-72b": "qwen/qwen2.5-72b-instruct",
-                  "mixtral-8x22b": "mistralai/mixtral-8x22b-instruct-v0.1"}
+                  "qwen3-next-80b": "qwen/qwen3-next-80b-a3b-instruct",
+                  "mistral-large-2": "mistralai/mistral-large-2-instruct"}
         run_analyses(docs, models, tmp, _fake_call_fn)
 
         # build_blind_eval / load_docs reads real GT dir; stub it to our docs
@@ -196,10 +196,10 @@ def test_blind_and_aggregate(monkeypatch_docs=True):
         by_model = {r["model"]: r for r in rows}
         check("llama higher coverage (un-blinded)",
               by_model["llama-3.1-70b"]["coverage"] == 5.0
-              and by_model["qwen2.5-72b"]["coverage"] == 3.0, str(by_model))
+              and by_model["qwen3-next-80b"]["coverage"] == 3.0, str(by_model))
         check("entity F1 = 1.0 (fake matches gt)",
               by_model["llama-3.1-70b"]["entity_f1"] == 1.0, str(by_model["llama-3.1-70b"]))
-        check("risk F1 = 1.0", by_model["mixtral-8x22b"]["risk_f1"] == 1.0)
+        check("risk F1 = 1.0", by_model["mistral-large-2"]["risk_f1"] == 1.0)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

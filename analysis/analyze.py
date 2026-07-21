@@ -28,10 +28,10 @@ from .prompt import build_messages, parse_analysis
 
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_FALLBACK = {  # optional --provider groq mapping (NIM is the primary)
-    "llama-3.1-70b": "llama-3.1-70b-versatile",
-    "qwen2.5-72b": "qwen-2.5-72b-instruct",
-    "mixtral-8x22b": "mixtral-8x7b-32768",
+# optional --provider groq escape hatch; Groq serves no equivalent of the two
+# NIM comparators, so only the deployed model has a mapping. NIM is canonical.
+GROQ_FALLBACK = {
+    "llama-3.1-70b": "llama-3.3-70b-versatile",
 }
 MAX_RETRIES = 6
 
@@ -63,6 +63,10 @@ def get_client(provider: str):
 
 def resolve_model_ids(provider: str, short_names: list[str]) -> dict[str, str]:
     if provider == "groq":
+        missing = [s for s in short_names if s not in GROQ_FALLBACK]
+        if missing:
+            raise SystemExit(f"no Groq equivalent for {missing}; use --provider nim "
+                             f"(Groq fallback covers only {list(GROQ_FALLBACK)})")
         return {s: GROQ_FALLBACK[s] for s in short_names}
     return {s: MODELS[s] for s in short_names}
 

@@ -20,10 +20,19 @@ DOC_CHAR_CAP = 96_000  # ~24k tokens safety cap; law docs are short (~3 pages)
 # The three models under comparison (cross-family, one provider = NVIDIA NIM).
 # short name -> API model id. Short names are used only in filenames/results,
 # never shown to blind raters.
+#
+# Re-selected 2026-07-21 against the live /v1/models catalog after NVIDIA
+# retired qwen/qwen2.5-72b-instruct and mistralai/mixtral-8x22b-instruct-v0.1:
+# - qwen3-next-80b: closest served Qwen instruct to the 70B tier. Tier caveat
+#   for the paper: 80B-total MoE with ~3B ACTIVE params/token (not dense 70B).
+# - mistral-large-2: 123B dense, released July 2024 (same month as Llama 3.1)
+#   -- era-matched flagship. Tier caveat: 123B dense sits above 70B.
+# Both comparators are as-new-or-newer than the deployed model (recency
+# asymmetry: a Llama win is a stronger claim; a loss is partly an era effect).
 MODELS = {
     "llama-3.1-70b": "meta/llama-3.1-70b-instruct",
-    "qwen2.5-72b": "qwen/qwen2.5-72b-instruct",
-    "mixtral-8x22b": "mistralai/mixtral-8x22b-instruct-v0.1",
+    "qwen3-next-80b": "qwen/qwen3-next-80b-a3b-instruct",
+    "mistral-large-2": "mistralai/mistral-large-2-instruct",
 }
 
 
