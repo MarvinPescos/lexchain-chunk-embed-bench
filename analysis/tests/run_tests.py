@@ -97,6 +97,19 @@ def test_prompt_parsing():
     p2 = parse_analysis(trailing)
     check("repairs trailing commas", p2 is not None and p2["entities"]["parties"] == ["A"])
 
+    # EXACT llama3.1:8b bug: dropped "quote": key -> bare "" for absent categories
+    # (both space and no-space variants in one payload)
+    dropped = ('{"summary":"S","entities":{"parties":[],"dates":[],'
+               '"monetary_amounts":[],"obligations":[]},"risk_flags":['
+               '{"category":"exclusivity","present":false, ""},'
+               '{"category":"non_compete","present":false,""}]}')
+    p3 = parse_analysis(dropped)
+    check("repairs dropped quote key (bare \"\")", p3 is not None, "still unparseable")
+    excl = next(f for f in p3["risk_flags"] if f["category"] == "exclusivity")
+    check("recovered absent category has quote key", excl["present"] is False
+          and excl["quote"] == "")
+    check("recovered payload is schema-valid", validate_schema(p3) == [])
+
     # normalization: missing/misordered categories get realigned; extras dropped
     partial = _good_obj()
     partial["risk_flags"] = [{"category": "governing_law", "present": True,
@@ -219,6 +232,8 @@ def test_ollama_json_format():
     call_fn("llama3.1-8b", [{"role": "user", "content": "hi"}])
     check("ollama gets response_format json_object",
           ollama.captured["response_format"] == {"type": "json_object"})
+    check("ollama sets native format:json via extra_body",
+          ollama.captured["extra_body"]["format"] == "json")
     check("ollama sets num_ctx",
           ollama.captured["extra_body"]["options"]["num_ctx"] == 32768)
     call_fn("llama-3.1-70b", [{"role": "user", "content": "hi"}])

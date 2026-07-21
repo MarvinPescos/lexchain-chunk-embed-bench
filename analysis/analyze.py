@@ -208,12 +208,16 @@ def make_call_fn(clients: dict):
         )
         if spec["backend"] == "ollama":
             # constrained JSON decoding so small models emit syntactically valid
-            # JSON (fixes e.g. llama3.1:8b markdown/preamble); the prompt already
-            # contains "JSON" as required by json_object mode.
+            # JSON (fixes llama3.1:8b's dropped-"quote"-key bug at the source).
+            # Belt and suspenders: the OpenAI-standard response_format (honored by
+            # Ollama's /v1 shim) AND Ollama's native top-level format via
+            # extra_body, so the constraint applies whichever route is taken.
             kwargs["response_format"] = {"type": "json_object"}
+            extra = {"format": "json"}
             if spec["num_ctx"]:
                 # explicit context so Ollama never silently truncates at its default
-                kwargs["extra_body"] = {"options": {"num_ctx": spec["num_ctx"]}}
+                extra["options"] = {"num_ctx": spec["num_ctx"]}
+            kwargs["extra_body"] = extra
         last_err = None
         for attempt in range(MAX_RETRIES):
             try:

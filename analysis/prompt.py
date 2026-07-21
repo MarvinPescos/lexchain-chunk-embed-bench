@@ -115,6 +115,11 @@ def strip_thinking(text: str) -> str:
 
 _FENCE_ANY = re.compile(r"```(?:json)?", re.IGNORECASE)
 _TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+# llama3.1:8b drops the "quote": key for absent risk categories and writes a
+# bare "" value: {"category":"exclusivity","present":false, ""}. Restore the key.
+# (`, ""}` only occurs in this malformed shape; a legit `"quote": ""}` has the
+# key before the comma is consumed, so this never corrupts valid JSON.)
+_BARE_EMPTY_QUOTE = re.compile(r',\s*""\s*}')
 
 
 def _strip_fences(text: str) -> str:
@@ -123,9 +128,10 @@ def _strip_fences(text: str) -> str:
 
 def _repair_json(text: str) -> str:
     """Best-effort cleanup for small-model JSON quirks (only used as a fallback
-    when strict parsing fails): remove markdown fences anywhere and trailing
-    commas before } or ]. Safe on already-valid JSON."""
+    when strict parsing fails): restore a dropped "quote": key, remove markdown
+    fences anywhere, and drop trailing commas before } or ]. Safe on valid JSON."""
     text = _FENCE_ANY.sub("", text)
+    text = _BARE_EMPTY_QUOTE.sub(', "quote": ""}', text)
     text = _TRAILING_COMMA.sub(r"\1", text)
     return text.strip()
 
