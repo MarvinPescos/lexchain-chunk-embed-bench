@@ -44,11 +44,9 @@ MODELS = {
         "backend": "ollama", "id": "mistral-nemo:12b", "role": "candidate",
         "native_ctx": 131072, "num_ctx": 32768,
     },
-    "gemma3-27b": {
-        "backend": "ollama", "id": "gemma3:27b", "role": "candidate",
+    "gemma3-12b": {
+        "backend": "ollama", "id": "gemma3:12b", "role": "candidate",
         "native_ctx": 131072, "num_ctx": 32768,
-        # q4 weights ~17GB: hard-asserted before any call (analyze.assert_vram)
-        "min_free_vram_gb": 17,
     },
     "llama-3.1-70b": {
         "backend": "nim", "id": "meta/llama-3.1-70b-instruct", "role": REFERENCE_ROLE,

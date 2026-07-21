@@ -127,19 +127,26 @@ def test_context_check():
     check("phi4 recorded as excluded with reason",
           "16k context" in EXCLUDED_MODELS["phi4-14b"]["reason"]
           and "phi4-14b" not in MODELS)
-    check("candidate set is 4 families + reference",
+    check("candidate set is 4 families + reference (all T4-viable)",
           set(MODELS) == {"llama3.1-8b", "qwen3-14b", "mistral-nemo-12b",
-                          "gemma3-27b", "llama-3.1-70b"})
+                          "gemma3-12b", "llama-3.1-70b"})
+    check("no candidate needs a VRAM gate (all T4-viable)",
+          all("min_free_vram_gb" not in s for s in MODELS.values()))
 
-    print("VRAM assertion (gemma3-27b needs >=17GB)")
-    assert_vram(["gemma3-27b"], free_gb=22.0)  # L4-sized: passes
-    check("sufficient VRAM passes", True)
-    for free, label in ((14.5, "T4-sized rejected"), (None, "no GPU rejected")):
-        try:
-            assert_vram(["gemma3-27b"], free_gb=free)
-            check(label, False)
-        except SystemExit as e:
-            check(label, "VRAM CHECK FAILED" in str(e))
+    print("VRAM assertion (generic guard, tested via injected requirement)")
+    MODELS["_vram_probe"] = {"backend": "ollama", "id": "probe", "role": "candidate",
+                             "native_ctx": 4096, "num_ctx": 4096, "min_free_vram_gb": 17}
+    try:
+        assert_vram(["_vram_probe"], free_gb=22.0)  # enough
+        check("sufficient VRAM passes", True)
+        for free, label in ((14.5, "T4-sized rejected"), (None, "no GPU rejected")):
+            try:
+                assert_vram(["_vram_probe"], free_gb=free)
+                check(label, False)
+            except SystemExit as e:
+                check(label, "VRAM CHECK FAILED" in str(e))
+    finally:
+        del MODELS["_vram_probe"]
     assert_vram(["llama3.1-8b"], free_gb=None)  # no requirement -> no check
     check("models without requirement skip vram check", True)
 
