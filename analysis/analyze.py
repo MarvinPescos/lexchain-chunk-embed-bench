@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
-"""Run the 3-model document analysis over a deterministic 10-doc Law sample.
+"""Run the 5-model document analysis over the deterministic 10-doc Law sample.
 
-For each (document, model): send the ONE fixed prompt (prompt.py) to the model
-via NVIDIA NIM (OpenAI-compatible), parse the JSON analysis, and checkpoint to
-    <cache>/analyses/{doc}__{model}.json   {model_id, raw, parsed, latency_s, usage, ok}
-Resumable (existing checkpoints are skipped). Rate limits / transient errors are
-retried with exponential backoff. Model IDs are validated against the live
-/v1/models catalog at startup.
+Model set (see data.MODELS): 4 self-hostable Ollama candidates + the NIM-hosted
+meta/llama-3.1-70b-instruct kept only as a "reference (non-deployable)" ceiling.
+One frozen prompt (prompt.PROMPT_VERSION), temperature 0, identical schema.
 
-Usage (Colab or local with NVIDIA_API_KEY set):
-  python -m analysis.analyze --smoke 2      # 2 docs x 3 models (smoke)
-  python -m analysis.analyze                # full 10 docs x 3 models
-  python -m analysis.analyze --models llama-3.1-70b,qwen2.5-72b
+Per (document, model): call the model, strip reasoning blocks if configured,
+parse + schema-validate the JSON; on parse/validation failure retry with backoff
+and log the raw output to <cache>/raw_failures/. Checkpoint every output to
+    <cache>/analyses/{doc}__{model}.json
+(resumable: existing checkpoints are skipped). A context-safety check runs
+BEFORE any call and refuses to run if any document could be truncated.
+
+Latency is wall-clock per call and labeled (default "colab_gpu") -- CPU
+deployment latency is measured separately on the server.
+
+Environment:
+  NVIDIA_API_KEY   for the NIM reference model
+  OLLAMA_BASE_URL  default http://localhost:11434/v1
+
+Usage:
+  python -m analysis.analyze --smoke 2                  # 2 docs x all 5 models
+  python -m analysis.analyze                            # full 10 x 5 = 50
+  python -m analysis.analyze --models llama3.1-8b,qwen3-14b
 """
 
 from __future__ import annotations
@@ -21,23 +32,32 @@ import difflib
 import json
 import os
 import time
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .data import MODELS, DEFAULT_SAMPLE_SIZE, load_docs, sample_stems
-from .prompt import build_messages, parse_analysis
+from .data import (
+    DEFAULT_SAMPLE_SIZE,
+    MAX_OUTPUT_TOKENS,
+    MODELS,
+    context_check,
+    load_docs,
+    sample_stems,
+)
+from .prompt import PROMPT_VERSION, build_messages, parse_analysis, validate_schema
 
 NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-# optional --provider groq escape hatch; Groq serves no equivalent of the two
-# NIM comparators, so only the deployed model has a mapping. NIM is canonical.
-GROQ_FALLBACK = {
-    "llama-3.1-70b": "llama-3.3-70b-versatile",
-}
-MAX_RETRIES = 6
+MAX_RETRIES = 6        # transport-level (rate limit / 5xx)
+PARSE_RETRIES = 2      # additional attempts when output fails parse/schema checks
+TEMPERATURE = 0
 
 
 def log(msg: str) -> None:
     print(f"[analyze] {msg}", flush=True)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def atomic_write_json(path: Path, obj) -> None:
@@ -47,62 +67,112 @@ def atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def get_client(provider: str):
+def ollama_base_url() -> str:
+    return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
+
+
+def get_clients(backends: set[str]) -> dict:
     from openai import OpenAI
 
-    if provider == "groq":
-        key = os.environ.get("GROQ_API_KEY")
+    clients = {}
+    if "nim" in backends:
+        key = os.environ.get("NVIDIA_API_KEY")
         if not key:
-            raise SystemExit("GROQ_API_KEY not set")
-        return OpenAI(base_url=GROQ_BASE_URL, api_key=key)
-    key = os.environ.get("NVIDIA_API_KEY")
-    if not key:
-        raise SystemExit("NVIDIA_API_KEY not set (Colab: add it as a secret)")
-    return OpenAI(base_url=NIM_BASE_URL, api_key=key)
+            raise SystemExit("NVIDIA_API_KEY not set (needed for the 70B reference; "
+                             "Colab: add it as a secret)")
+        clients["nim"] = OpenAI(base_url=NIM_BASE_URL, api_key=key)
+    if "ollama" in backends:
+        clients["ollama"] = OpenAI(base_url=ollama_base_url(), api_key="ollama")
+    return clients
 
 
-def resolve_model_ids(provider: str, short_names: list[str]) -> dict[str, str]:
-    if provider == "groq":
-        missing = [s for s in short_names if s not in GROQ_FALLBACK]
-        if missing:
-            raise SystemExit(f"no Groq equivalent for {missing}; use --provider nim "
-                             f"(Groq fallback covers only {list(GROQ_FALLBACK)})")
-        return {s: GROQ_FALLBACK[s] for s in short_names}
-    return {s: MODELS[s] for s in short_names}
+def validate_models(clients: dict, short_names: list[str]) -> None:
+    """Assert every requested model is served by its backend; fail with hints."""
+    problems = []
+    for backend, client in clients.items():
+        wanted = {s: MODELS[s]["id"] for s in short_names if MODELS[s]["backend"] == backend}
+        if not wanted:
+            continue
+        try:
+            served = [m.id for m in client.models.list().data]
+        except Exception as e:
+            problems.append(f"{backend}: cannot list models ({e}) -- is the endpoint up?")
+            continue
+        for s, mid in wanted.items():
+            # Ollama lists tags as e.g. "llama3.1:8b"; exact match expected
+            if mid not in served:
+                near = difflib.get_close_matches(mid, served, n=3, cutoff=0.3)
+                hint = f"run `ollama pull {mid}`" if backend == "ollama" else f"closest: {near}"
+                problems.append(f"{backend}: '{mid}' ({s}) not served -- {hint}")
+    if problems:
+        raise SystemExit("Model validation failed:\n  " + "\n  ".join(problems))
+    log(f"validated {len(short_names)} models across {sorted(clients)} backends")
 
 
-def validate_models(client, model_ids: dict[str, str]) -> None:
-    """Assert every requested model id is served; else show closest matches + exit."""
+def ollama_model_meta(model_id: str) -> dict:
+    """Quantization/parameter metadata from Ollama's /api/show (best effort)."""
+    base = ollama_base_url().removesuffix("/v1")
     try:
-        served = [m.id for m in client.models.list().data]
-    except Exception as e:  # network/catalog issue shouldn't hard-block the run
-        log(f"WARN: could not list /v1/models ({e}); skipping validation")
-        return
-    missing = {s: mid for s, mid in model_ids.items() if mid not in served}
-    if missing:
-        lines = ["Some requested models are NOT served by this provider:"]
-        for s, mid in missing.items():
-            near = difflib.get_close_matches(mid, served, n=3, cutoff=0.3)
-            lines.append(f"  {s} -> '{mid}' NOT FOUND. closest: {near or '(none)'}")
-        lines.append(f"({len(served)} models available; e.g. {served[:5]})")
-        raise SystemExit("\n".join(lines))
-    log(f"validated {len(model_ids)} model ids against {len(served)} served models")
+        req = urllib.request.Request(
+            base + "/api/show",
+            data=json.dumps({"model": model_id}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            details = json.load(r).get("details", {})
+        return {
+            "quantization": details.get("quantization_level"),
+            "parameter_size": details.get("parameter_size"),
+            "family": details.get("family"),
+        }
+    except Exception as e:
+        return {"quantization": None, "error": f"{type(e).__name__}: {e}"}
 
 
-def make_nim_call_fn(client):
-    """Returns call_fn(model_id, messages) -> (text, usage_dict, latency_s) with backoff."""
+def collect_models_meta(cache_dir: Path, short_names: list[str]) -> dict:
+    """Record exact tag, quantization, num_ctx, temperature per model."""
+    meta_path = cache_dir / "models_meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    for s in short_names:
+        spec = MODELS[s]
+        entry = {
+            "id": spec["id"],
+            "backend": spec["backend"],
+            "role": spec["role"],
+            "num_ctx": spec["num_ctx"],
+            "native_ctx": spec["native_ctx"],
+            "temperature": TEMPERATURE,
+            "max_output_tokens": MAX_OUTPUT_TOKENS,
+            "prompt_version": PROMPT_VERSION,
+            "recorded_at": now_iso(),
+        }
+        if spec["backend"] == "ollama":
+            entry.update(ollama_model_meta(spec["id"]))
+        meta[s] = entry
+    atomic_write_json(meta_path, meta)
+    return meta
 
-    def call_fn(model_id: str, messages: list[dict]):
+
+def make_call_fn(clients: dict):
+    """call_fn(short_name, messages) -> (text, usage, latency_s) with backoff."""
+
+    def call_fn(short: str, messages: list[dict]):
+        spec = MODELS[short]
+        client = clients[spec["backend"]]
+        kwargs = dict(
+            model=spec["id"],
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_OUTPUT_TOKENS,
+        )
+        if spec["backend"] == "ollama" and spec["num_ctx"]:
+            # explicit context so Ollama never silently truncates at its default
+            kwargs["extra_body"] = {"options": {"num_ctx": spec["num_ctx"]}}
         last_err = None
         for attempt in range(MAX_RETRIES):
             try:
                 t0 = time.time()
-                resp = client.chat.completions.create(
-                    model=model_id,
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=2048,
-                )
+                resp = client.chat.completions.create(**kwargs)
                 latency = time.time() - t0
                 usage = getattr(resp, "usage", None)
                 usage_d = (
@@ -111,43 +181,75 @@ def make_nim_call_fn(client):
                     if usage else {}
                 )
                 return resp.choices[0].message.content or "", usage_d, latency
-            except Exception as e:  # rate limit / 5xx / transient
+            except Exception as e:
                 last_err = e
                 wait = min(2 ** attempt, 30)
-                log(f"  {model_id}: {type(e).__name__} (attempt {attempt+1}/{MAX_RETRIES}), backoff {wait}s")
+                log(f"  {spec['id']}: {type(e).__name__} "
+                    f"(attempt {attempt+1}/{MAX_RETRIES}), backoff {wait}s")
                 time.sleep(wait)
-        raise RuntimeError(f"exhausted retries for {model_id}: {last_err}")
+        raise RuntimeError(f"exhausted retries for {spec['id']}: {last_err}")
 
     return call_fn
 
 
-def run_analyses(docs: dict[str, str], model_ids: dict[str, str], cache_dir: Path,
-                 call_fn, resume: bool = True) -> list[Path]:
-    """Analyze each doc with each model, checkpointing every output. Returns paths."""
+def _log_raw_failure(cache_dir: Path, stem: str, short: str, attempt: int,
+                     raw: str, problems: list[str]) -> None:
+    fail_dir = cache_dir / "raw_failures"
+    fail_dir.mkdir(parents=True, exist_ok=True)
+    (fail_dir / f"{stem}__{short}__attempt{attempt}.txt").write_text(
+        f"# problems: {problems}\n{raw}", encoding="utf-8"
+    )
+
+
+def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
+                 call_fn, latency_label: str = "colab_gpu",
+                 resume: bool = True) -> list[Path]:
+    """Analyze each doc with each model, checkpointing every output."""
     out_dir = cache_dir / "analyses"
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
-    total = len(docs) * len(model_ids)
+    total = len(docs) * len(short_names)
     i = 0
     for stem, text in docs.items():
         messages = build_messages(text)
-        for short, model_id in model_ids.items():
+        for short in short_names:
+            spec = MODELS[short]
             i += 1
             path = out_dir / f"{stem}__{short}.json"
             if resume and path.exists():
-                log(f"[{i}/{total}] {stem} x {short}: cached, skip")
+                log(f"[{i}/{total}] {stem[:40]} x {short}: cached, skip")
                 written.append(path)
                 continue
-            log(f"[{i}/{total}] {stem} x {short}: calling {model_id} ...")
-            raw, usage, latency = call_fn(model_id, messages)
-            parsed = parse_analysis(raw)
+            log(f"[{i}/{total}] {stem[:40]} x {short}: calling {spec['id']} ...")
+
+            raw, usage, latency = "", {}, None
+            parsed, problems = None, ["not called"]
+            for attempt in range(1 + PARSE_RETRIES):
+                raw, usage, latency = call_fn(short, messages)
+                parsed = parse_analysis(raw)  # strips <think> blocks internally
+                problems = validate_schema(parsed) if parsed else ["unparseable JSON"]
+                if not problems:
+                    break
+                _log_raw_failure(cache_dir, stem, short, attempt, raw, problems)
+                log(f"    parse/schema attempt {attempt+1} failed: {problems[:2]}")
+                time.sleep(min(2 ** attempt, 10))
+
             atomic_write_json(path, {
-                "doc": stem, "model": short, "model_id": model_id,
-                "raw": raw, "parsed": parsed, "ok": parsed is not None,
-                "latency_s": round(latency, 3), "usage": usage,
+                "doc": stem, "model": short, "model_id": spec["id"],
+                "backend": spec["backend"], "role": spec["role"],
+                "prompt_version": PROMPT_VERSION,
+                "temperature": TEMPERATURE, "num_ctx": spec["num_ctx"],
+                "strip_think": bool(spec.get("strip_think")),
+                "raw": raw, "parsed": parsed,
+                "ok": parsed is not None and not problems,
+                "schema_problems": problems if problems else [],
+                "latency_s": round(latency, 3) if latency is not None else None,
+                "latency_label": latency_label,
+                "usage": usage, "ts": now_iso(),
             })
-            status = "ok" if parsed else "UNPARSEABLE"
-            log(f"    -> {status} ({latency:.1f}s, {usage.get('completion_tokens','?')} out tok)")
+            status = "ok" if (parsed and not problems) else f"PROBLEMS {problems[:1]}"
+            log(f"    -> {status} ({latency:.1f}s, "
+                f"{usage.get('completion_tokens', '?')} out tok)")
             written.append(path)
     return written
 
@@ -160,9 +262,10 @@ def main():
                                  if on_colab else ".cache_analysis"))
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--limit-docs", type=int, default=DEFAULT_SAMPLE_SIZE)
-    ap.add_argument("--smoke", type=int, default=None, metavar="N",
-                    help="quick run on N docs (e.g. 2) x all models")
-    ap.add_argument("--provider", choices=["nim", "groq"], default="nim")
+    ap.add_argument("--smoke", type=int, default=None, metavar="N")
+    ap.add_argument("--latency-label", default="colab_gpu")
+    ap.add_argument("--skip-context-check", action="store_true",
+                    help="NOT recommended; the check prevents silent truncation")
     args = ap.parse_args()
 
     short_names = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -176,20 +279,27 @@ def main():
     n = args.smoke if args.smoke is not None else args.limit_docs
     stems = sample_stems(all_docs.keys(), n=n)
     docs = {s: all_docs[s] for s in stems}
-    (args.cache_dir).mkdir(parents=True, exist_ok=True)
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_json(args.cache_dir / "sample.json",
                       {"seed": 42, "n": len(stems), "stems": stems})
-    log(f"{len(docs)} docs x {len(short_names)} models = {len(docs)*len(short_names)} calls")
-    log(f"sample stems: {stems}")
+    log(f"{len(docs)} docs x {len(short_names)} models = "
+        f"{len(docs) * len(short_names)} calls | prompt {PROMPT_VERSION}")
 
-    client = get_client(args.provider)
-    model_ids = resolve_model_ids(args.provider, short_names)
-    validate_models(client, model_ids)
-    call_fn = make_nim_call_fn(client)
+    if not args.skip_context_check:
+        report = context_check(docs, short_names)
+        log(f"context check OK (prompt overhead "
+            f"{report['prompt_overhead_tokens']} tok; all docs fit all models)")
+
+    backends = {MODELS[s]["backend"] for s in short_names}
+    clients = get_clients(backends)
+    validate_models(clients, short_names)
+    collect_models_meta(args.cache_dir, short_names)
+    call_fn = make_call_fn(clients)
 
     t0 = time.time()
-    run_analyses(docs, model_ids, args.cache_dir, call_fn)
-    log(f"done in {(time.time()-t0)/60:.1f} min -> {args.cache_dir}/analyses")
+    run_analyses(docs, short_names, args.cache_dir, call_fn,
+                 latency_label=args.latency_label)
+    log(f"done in {(time.time() - t0) / 60:.1f} min -> {args.cache_dir}/analyses")
 
 
 if __name__ == "__main__":

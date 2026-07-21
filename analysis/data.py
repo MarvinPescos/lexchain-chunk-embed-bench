@@ -17,23 +17,45 @@ SAMPLE_SEED = 42
 DEFAULT_SAMPLE_SIZE = 10
 DOC_CHAR_CAP = 96_000  # ~24k tokens safety cap; law docs are short (~3 pages)
 
-# The three models under comparison (cross-family, one provider = NVIDIA NIM).
-# short name -> API model id. Short names are used only in filenames/results,
-# never shown to blind raters.
+# The model set (pivot 2026-07-21): LexChain needs a SELF-HOSTABLE model, so the
+# candidates are 4 Ollama models runnable on commodity GPUs; the NIM-hosted 70B
+# is kept ONLY as a reference ceiling and is labeled non-deployable everywhere.
 #
-# Re-selected 2026-07-21 against the live /v1/models catalog after NVIDIA
-# retired qwen/qwen2.5-72b-instruct and mistralai/mixtral-8x22b-instruct-v0.1:
-# - qwen3-next-80b: closest served Qwen instruct to the 70B tier. Tier caveat
-#   for the paper: 80B-total MoE with ~3B ACTIVE params/token (not dense 70B).
-# - mistral-large-2: 123B dense, released July 2024 (same month as Llama 3.1)
-#   -- era-matched flagship. Tier caveat: 123B dense sits above 70B.
-# Both comparators are as-new-or-newer than the deployed model (recency
-# asymmetry: a Llama win is a stronger claim; a loss is partly an era effect).
+# short name -> spec. Short names are used in filenames/results, never shown to
+# blind raters.
+#   backend      "ollama" (OpenAI-compatible local endpoint) or "nim"
+#   id           model tag / API id
+#   role         "candidate" or the reference label (surfaced in key + tables)
+#   native_ctx   model's maximum context window (tokens)
+#   num_ctx      context we request explicitly (Ollama options.num_ctx)
+#   strip_think  strip <think>...</think> before parsing (Qwen3 thinking mode)
+REFERENCE_ROLE = "reference (non-deployable)"
+
 MODELS = {
-    "llama-3.1-70b": "meta/llama-3.1-70b-instruct",
-    "qwen3-next-80b": "qwen/qwen3-next-80b-a3b-instruct",
-    "mistral-large-2": "mistralai/mistral-large-2-instruct",
+    "llama3.1-8b": {
+        "backend": "ollama", "id": "llama3.1:8b", "role": "candidate",
+        "native_ctx": 131072, "num_ctx": 32768,
+    },
+    "qwen3-14b": {
+        "backend": "ollama", "id": "qwen3:14b", "role": "candidate",
+        "native_ctx": 40960, "num_ctx": 32768, "strip_think": True,
+    },
+    "phi4-14b": {
+        "backend": "ollama", "id": "phi4:14b", "role": "candidate",
+        "native_ctx": 16384, "num_ctx": 16384,
+    },
+    "gemma3-27b": {
+        "backend": "ollama", "id": "gemma3:27b", "role": "candidate",
+        "native_ctx": 131072, "num_ctx": 32768,
+    },
+    "llama-3.1-70b": {
+        "backend": "nim", "id": "meta/llama-3.1-70b-instruct", "role": REFERENCE_ROLE,
+        "native_ctx": 131072, "num_ctx": None,  # hosted; no num_ctx knob
+    },
 }
+
+MAX_OUTPUT_TOKENS = 2048
+CTX_SAFETY_MARGIN = 512
 
 
 def load_docs(gt_dir: Path = GT_DIR) -> dict[str, str]:
@@ -53,3 +75,45 @@ def sample_stems(all_stems, n: int = DEFAULT_SAMPLE_SIZE, seed: int = SAMPLE_SEE
     if n >= len(stems):
         return stems
     return sorted(random.Random(seed).sample(stems, n))
+
+
+def context_check(docs: dict[str, str], model_names=None) -> dict:
+    """Context-safety guard (fail loudly, never silently truncate).
+
+    Tokenizes every document (cl100k_base as a cross-model estimate) plus the
+    frozen prompt overhead and output budget, and asserts the total fits each
+    model's requested num_ctx (and native_ctx). Raises SystemExit listing every
+    (model, doc) that does not fit. Returns a report dict when all fit.
+    """
+    import tiktoken
+
+    from .prompt import prompt_overhead_text
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    overhead = len(enc.encode(prompt_overhead_text(), disallowed_special=()))
+    doc_tokens = {s: len(enc.encode(t, disallowed_special=())) for s, t in docs.items()}
+    budget_extra = overhead + MAX_OUTPUT_TOKENS + CTX_SAFETY_MARGIN
+
+    names = model_names or list(MODELS)
+    failures, per_model = [], {}
+    for name in names:
+        spec = MODELS[name]
+        limit = spec["num_ctx"] or spec["native_ctx"]
+        worst = max(doc_tokens.values()) + budget_extra
+        per_model[name] = {"limit": limit, "worst_case_tokens": worst}
+        for stem, dt in doc_tokens.items():
+            need = dt + budget_extra
+            if need > limit:
+                failures.append(
+                    f"  {name} (ctx {limit:,}): doc '{stem[:50]}' needs ~{need:,} tokens "
+                    f"({dt:,} doc + {overhead} prompt + {MAX_OUTPUT_TOKENS} output "
+                    f"+ {CTX_SAFETY_MARGIN} margin)"
+                )
+    if failures:
+        raise SystemExit(
+            "CONTEXT CHECK FAILED — refusing to run (documents are never truncated):\n"
+            + "\n".join(failures)
+            + "\nFix: use a model with a larger context, or change the model set."
+        )
+    return {"prompt_overhead_tokens": overhead, "doc_tokens": doc_tokens,
+            "per_model": per_model}

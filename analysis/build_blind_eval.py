@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Build the blind human-scoring scaffold from the cached analyses.
+"""Build the blind human-scoring scaffold from the cached analyses (50 rows).
+
+GUARDRAIL: this refuses to run until <cache>/ground_truth_key.csv exists and has
+at least one filled row -- the ground-truth key must be hand-authored BLIND to
+model outputs, and this file is the first place model outputs are rendered.
+(--force exists for the CPU test-suite only.)
 
 Outputs (in <cache>):
-  blind_eval.csv             30 rows (10 docs x 3 models); model identity hidden
-                             behind a per-doc random label (Output A/B/C), rows
-                             shuffled. Blank human-rating columns to fill.
-  unblinding_key.csv         presentation_id -> doc, model, label (kept SEPARATE)
-  ground_truth_key_template.csv  10 rows (one per doc); blank true-entity/risk
-                             columns to fill BEFORE scoring, plus source text.
-
-Seeded (42) so the blinding + ordering are reproducible.
-Do NOT open unblinding_key.csv until ratings are finished.
+  blind_eval.csv    one row per (doc, model) = 10 x 5 = 50. Model identity is
+                    hidden behind a per-doc randomized label (Output A..E) and
+                    rows are shuffled. Human rating columns use the SummEval
+                    dimensions: coherence, consistency, fluency, relevance
+                    (1-5 Likert), plus hallucination notes.
+  unblinding_key.csv presentation_id -> doc, label, model, role
+                    (role marks the 70B "reference (non-deployable)" row).
+Seeded (42) so blinding is reproducible. Do NOT open the key until rating is done.
 """
 
 from __future__ import annotations
@@ -21,22 +25,18 @@ import json
 import random
 from pathlib import Path
 
-from .data import load_docs
+from .data import MODELS
 from .prompt import ENTITY_CATEGORIES
-from .prepare_ground_truth import write_ground_truth_template
 
 BLIND_SEED = 42
-LABELS = ["Output A", "Output B", "Output C"]
+LABELS = ["Output A", "Output B", "Output C", "Output D", "Output E"]
 
 HUMAN_COLS = [
-    "summary_coverage_1to5",
-    "summary_accuracy_1to5",
-    "summary_fluency_1to5",
-    "entities_correct_1to5",
-    "entities_missed_notes",
-    "risk_flags_correct_1to5",
+    "coherence_1to5",     # SummEval: collective quality / organization of the summary
+    "consistency_1to5",   # SummEval: factual alignment with the source document
+    "fluency_1to5",       # SummEval: grammatical / readable sentences
+    "relevance_1to5",     # SummEval: captures the important content
     "hallucinations_notes",
-    "overall_notes",
 ]
 
 
@@ -49,11 +49,13 @@ def _fmt_entities(entities: dict) -> str:
 
 
 def _fmt_risks(risk_flags: list) -> str:
-    if not risk_flags:
-        return "(none)"
-    return "\n".join(
-        f"- [{(f.get('severity') or '?')}] {f.get('risk','')}" for f in risk_flags
-    )
+    """Checklist rendering: present categories with their quotes, then absents."""
+    present = [f for f in risk_flags if f.get("present")]
+    absent = [f["category"] for f in risk_flags if not f.get("present")]
+    lines = [f"- {f['category']}: \"{f.get('quote', '')}\"" for f in present] or ["(none present)"]
+    if absent:
+        lines.append("absent: " + ", ".join(absent))
+    return "\n".join(lines)
 
 
 def load_analyses(cache_dir: Path) -> dict[str, dict[str, dict]]:
@@ -66,11 +68,29 @@ def load_analyses(cache_dir: Path) -> dict[str, dict[str, dict]]:
     return out
 
 
-def build(cache_dir: Path) -> tuple[int, int]:
+def gt_key_ready(cache_dir: Path) -> bool:
+    """True iff ground_truth_key.csv exists with >=1 row that has any filled cell."""
+    path = cache_dir / "ground_truth_key.csv"
+    if not path.exists():
+        return False
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if any(v.strip() for k, v in row.items() if k != "doc_reference" and v):
+                return True
+    return False
+
+
+def build(cache_dir: Path, force: bool = False) -> tuple[int, int]:
+    if not force and not gt_key_ready(cache_dir):
+        raise SystemExit(
+            "GUARDRAIL: ground_truth_key.csv is missing or empty in "
+            f"{cache_dir}.\nAuthor the key first (from doc_texts/, blind to model "
+            "outputs), save it as ground_truth_key.csv, then re-run. "
+            "The blind sheet renders model outputs and must come second."
+        )
     analyses = load_analyses(cache_dir)
     if not analyses:
         raise SystemExit(f"no analyses in {cache_dir}/analyses (run analyze.py first)")
-    docs_text = load_docs()
     rng = random.Random(BLIND_SEED)
 
     blind_rows, key_rows = [], []
@@ -93,6 +113,7 @@ def build(cache_dir: Path) -> tuple[int, int]:
             key_rows.append({
                 "presentation_id": pres_id, "doc_reference": doc,
                 "output_label": label, "model": model,
+                "role": MODELS[model]["role"] if model in MODELS else "candidate",
             })
 
     rng.shuffle(blind_rows)  # global row shuffle so doc order doesn't leak either
@@ -108,13 +129,9 @@ def build(cache_dir: Path) -> tuple[int, int]:
     key_path = cache_dir / "unblinding_key.csv"
     with open(key_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["presentation_id", "doc_reference",
-                                          "output_label", "model"])
+                                          "output_label", "model", "role"])
         w.writeheader()
         w.writerows(sorted(key_rows, key=lambda r: r["presentation_id"]))
-
-    # blank hand-authored ground-truth template (same canonical writer as
-    # prepare_ground_truth.py, so the two never drift)
-    write_ground_truth_template(cache_dir, {doc: docs_text.get(doc, "") for doc in sorted(analyses)})
 
     return len(blind_rows), len(key_rows)
 
@@ -125,13 +142,13 @@ def main():
     ap.add_argument("--cache-dir", type=Path,
                     default=Path("/content/drive/MyDrive/lexchain_bench/analysis"
                                  if on_colab else ".cache_analysis"))
+    ap.add_argument("--force", action="store_true",
+                    help="bypass the ground-truth-first guardrail (tests only)")
     args = ap.parse_args()
-    n_blind, _ = build(args.cache_dir)
-    print(f"Wrote blind_eval.csv ({n_blind} rows), unblinding_key.csv, "
-          f"ground_truth_key_template.csv -> {args.cache_dir}")
-    print("Rating columns are 1-5 (5 best). Fill blind_eval.csv (identity hidden) and")
-    print("ground_truth_key_template.csv (true entities/risks per doc) BEFORE aggregating.")
-    print("Do NOT open unblinding_key.csv until ratings are done.")
+    n_blind, _ = build(args.cache_dir, force=args.force)
+    print(f"Wrote blind_eval.csv ({n_blind} rows) and unblinding_key.csv -> {args.cache_dir}")
+    print("SummEval rating columns (1-5, 5 best): coherence / consistency / fluency / relevance,")
+    print("plus hallucinations_notes. Do NOT open unblinding_key.csv until rating is done.")
 
 
 if __name__ == "__main__":
