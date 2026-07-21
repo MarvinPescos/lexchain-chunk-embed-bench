@@ -22,9 +22,9 @@ from analysis.prompt import (  # noqa: E402
     strip_thinking,
     validate_schema,
 )
-from analysis.data import MODELS, REFERENCE_ROLE, context_check  # noqa: E402
+from analysis.data import EXCLUDED_MODELS, MODELS, REFERENCE_ROLE, context_check  # noqa: E402
 from analysis.matching_entities import score_category  # noqa: E402
-from analysis.analyze import run_analyses  # noqa: E402
+from analysis.analyze import assert_vram, run_analyses  # noqa: E402
 from analysis import aggregate_analysis, build_blind_eval, prepare_ground_truth  # noqa: E402
 
 PASS = 0
@@ -124,13 +124,24 @@ def test_context_check():
         check("oversized doc rejected", False)
     except SystemExit as e:
         check("oversized doc rejected", "CONTEXT CHECK FAILED" in str(e))
-    # phi4's 16k window: a ~18k-token doc must be rejected for phi4 specifically
-    doc18k = {"doc": "word " * 18000}
-    try:
-        context_check(doc18k, ["phi4-14b"])
-        check("phi4 16k limit enforced", False)
-    except SystemExit as e:
-        check("phi4 16k limit enforced", "phi4-14b" in str(e))
+    check("phi4 recorded as excluded with reason",
+          "16k context" in EXCLUDED_MODELS["phi4-14b"]["reason"]
+          and "phi4-14b" not in MODELS)
+    check("candidate set is 4 families + reference",
+          set(MODELS) == {"llama3.1-8b", "qwen3-14b", "mistral-nemo-12b",
+                          "gemma3-27b", "llama-3.1-70b"})
+
+    print("VRAM assertion (gemma3-27b needs >=17GB)")
+    assert_vram(["gemma3-27b"], free_gb=22.0)  # L4-sized: passes
+    check("sufficient VRAM passes", True)
+    for free, label in ((14.5, "T4-sized rejected"), (None, "no GPU rejected")):
+        try:
+            assert_vram(["gemma3-27b"], free_gb=free)
+            check(label, False)
+        except SystemExit as e:
+            check(label, "VRAM CHECK FAILED" in str(e))
+    assert_vram(["llama3.1-8b"], free_gb=None)  # no requirement -> no check
+    check("models without requirement skip vram check", True)
 
 
 def test_prepare_ground_truth():
@@ -249,10 +260,10 @@ def test_blind_gate_and_aggregate():
         by_model = {r["model"]: r for r in rows}
         check("SummEval means un-blinded",
               by_model["llama3.1-8b"]["coherence"] == 5.0
-              and by_model["phi4-14b"]["coherence"] == 3.0)
+              and by_model["mistral-nemo-12b"]["coherence"] == 3.0)
         check("risk F1 rewards the complete model",
               by_model["llama3.1-8b"]["risk_f1"] == 1.0
-              and by_model["phi4-14b"]["risk_f1"] < 1.0,
+              and by_model["mistral-nemo-12b"]["risk_f1"] < 1.0,
               str({m: by_model[m]["risk_f1"] for m in by_model}))
         check("entity F1 = 1.0 all (fake entities match key)",
               all(by_model[m]["entity_f1"] == 1.0 for m in by_model))

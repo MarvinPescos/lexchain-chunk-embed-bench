@@ -38,6 +38,7 @@ from pathlib import Path
 
 from .data import (
     DEFAULT_SAMPLE_SIZE,
+    EXCLUDED_MODELS,
     MAX_OUTPUT_TOKENS,
     MODELS,
     context_check,
@@ -109,6 +110,41 @@ def validate_models(clients: dict, short_names: list[str]) -> None:
     log(f"validated {len(short_names)} models across {sorted(clients)} backends")
 
 
+def _nvidia_free_vram_gb() -> float | None:
+    """Free VRAM of GPU 0 in GB via nvidia-smi, or None if unavailable."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip().splitlines()
+        return int(out[0]) / 1024 if out else None
+    except (FileNotFoundError, ValueError, IndexError, Exception):
+        return None
+
+
+def assert_vram(short_names: list[str], free_gb=None) -> None:
+    """Hard requirement: models with min_free_vram_gb refuse to run without it
+    (CPU offload would silently wreck the latency comparison)."""
+    needy = [(s, MODELS[s]["min_free_vram_gb"]) for s in short_names
+             if MODELS[s].get("min_free_vram_gb")]
+    if not needy:
+        return
+    free = free_gb if free_gb is not None else _nvidia_free_vram_gb()
+    problems = []
+    for s, need in needy:
+        if free is None:
+            problems.append(f"{s} needs >={need}GB free VRAM but no GPU/nvidia-smi "
+                            f"was found (CPU offload is not acceptable)")
+        elif free < need:
+            problems.append(f"{s} needs >={need}GB free VRAM, only {free:.1f}GB free "
+                            f"-- use an L4/A100 runtime")
+    if problems:
+        raise SystemExit("VRAM CHECK FAILED:\n  " + "\n  ".join(problems))
+    log(f"VRAM check OK ({free:.1f}GB free) for {[s for s, _ in needy]}")
+
+
 def ollama_model_meta(model_id: str) -> dict:
     """Quantization/parameter metadata from Ollama's /api/show (best effort)."""
     base = ollama_base_url().removesuffix("/v1")
@@ -149,6 +185,8 @@ def collect_models_meta(cache_dir: Path, short_names: list[str]) -> dict:
         if spec["backend"] == "ollama":
             entry.update(ollama_model_meta(spec["id"]))
         meta[s] = entry
+    # auditable record of models screened out before the run
+    meta["_excluded"] = EXCLUDED_MODELS
     atomic_write_json(meta_path, meta)
     return meta
 
@@ -266,6 +304,8 @@ def main():
     ap.add_argument("--latency-label", default="colab_gpu")
     ap.add_argument("--skip-context-check", action="store_true",
                     help="NOT recommended; the check prevents silent truncation")
+    ap.add_argument("--skip-vram-check", action="store_true",
+                    help="NOT recommended; CPU offload wrecks the latency numbers")
     args = ap.parse_args()
 
     short_names = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -289,6 +329,8 @@ def main():
         report = context_check(docs, short_names)
         log(f"context check OK (prompt overhead "
             f"{report['prompt_overhead_tokens']} tok; all docs fit all models)")
+    if not args.skip_vram_check:
+        assert_vram(short_names)
 
     backends = {MODELS[s]["backend"] for s in short_names}
     clients = get_clients(backends)

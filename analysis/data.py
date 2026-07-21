@@ -40,17 +40,31 @@ MODELS = {
         "backend": "ollama", "id": "qwen3:14b", "role": "candidate",
         "native_ctx": 40960, "num_ctx": 32768, "strip_think": True,
     },
-    "phi4-14b": {
-        "backend": "ollama", "id": "phi4:14b", "role": "candidate",
-        "native_ctx": 16384, "num_ctx": 16384,
+    "mistral-nemo-12b": {
+        "backend": "ollama", "id": "mistral-nemo:12b", "role": "candidate",
+        "native_ctx": 131072, "num_ctx": 32768,
     },
     "gemma3-27b": {
         "backend": "ollama", "id": "gemma3:27b", "role": "candidate",
         "native_ctx": 131072, "num_ctx": 32768,
+        # q4 weights ~17GB: hard-asserted before any call (analyze.assert_vram)
+        "min_free_vram_gb": 17,
     },
     "llama-3.1-70b": {
         "backend": "nim", "id": "meta/llama-3.1-70b-instruct", "role": REFERENCE_ROLE,
         "native_ctx": 131072, "num_ctx": None,  # hosted; no num_ctx knob
+    },
+}
+
+# Models considered but excluded at eligibility screening -- recorded in
+# models_meta.json and the paper so the selection is auditable.
+EXCLUDED_MODELS = {
+    "phi4-14b": {
+        "id": "phi4:14b",
+        "reason": "excluded at eligibility: 16k context cannot hold 2/10 sampled "
+                  "documents without truncation; candidates must process every "
+                  "document whole.",
+        "excluded_on": "2026-07-21",
     },
 }
 
