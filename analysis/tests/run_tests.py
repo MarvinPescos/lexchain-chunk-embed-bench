@@ -65,8 +65,9 @@ def test_registry():
     check("Meta + Qwen retained",
           {s["family"] for s in MODELS.values()} >= {"Meta", "Qwen"})
     check("every model has a tier_note", all(s.get("tier_note") for s in MODELS.values()))
-    check("ZDR provider prefs", PROVIDER_PREFS == {"data_collection": "deny",
-          "allow_fallbacks": False, "zdr": True})
+    check("ZDR provider prefs (DeepInfra-pinned, no fallback)",
+          PROVIDER_PREFS == {"order": ["deepinfra"], "allow_fallbacks": False,
+                             "data_collection": "deny", "zdr": True})
 
 
 def test_prompt_parsing():

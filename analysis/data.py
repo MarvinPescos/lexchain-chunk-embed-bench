@@ -54,11 +54,20 @@ MODELS = {
     },
 }
 
-# OpenRouter provider routing: zero data retention, no data collection, and NO
-# fallback to a non-compliant provider (fail loudly rather than leak). Applied to
-# every request via extra_body["provider"]. (Prompt logging is additionally an
-# account-level OpenRouter privacy setting the user must disable.)
-PROVIDER_PREFS = {"data_collection": "deny", "allow_fallbacks": False, "zdr": True}
+# OpenRouter provider routing. Pinned to DeepInfra: it is ZDR-compliant AND
+# supports response_format=json_object for all three models (llama via
+# deepinfra/turbo, qwen fp8, deepseek fp4). Novita -- also ZDR -- returns 400
+# "response_format json_object is not supported", so we pin the order and keep
+# allow_fallbacks:false so routing never lands on a JSON-incapable provider.
+# Zero data retention + no data collection retained. Applied to every request
+# via extra_body["provider"]. (Prompt logging is additionally an account-level
+# OpenRouter privacy setting the user must disable.)
+PROVIDER_PREFS = {
+    "order": ["deepinfra"],
+    "allow_fallbacks": False,
+    "data_collection": "deny",
+    "zdr": True,
+}
 
 # No eligibility exclusions in this design (API-only, all tier-matched).
 EXCLUDED_MODELS: dict = {}

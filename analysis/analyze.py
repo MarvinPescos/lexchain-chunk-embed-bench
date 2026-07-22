@@ -189,6 +189,9 @@ def make_call_fn(clients: dict):
                      "completion_tokens": usage.completion_tokens}
                     if usage else {}
                 )
+                # record which provider actually served the call (confirms the
+                # DeepInfra pin held; documents provider/quant for the paper)
+                usage_d["provider"] = getattr(resp, "provider", None)
                 return resp.choices[0].message.content or "", usage_d, latency
             except Exception as e:
                 # Permanent client errors (404 no ZDR endpoint, 400/401/403) are
