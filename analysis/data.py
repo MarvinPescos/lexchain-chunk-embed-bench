@@ -42,17 +42,15 @@ MODELS = {
         "role": "candidate", "family": "Qwen", "native_ctx": 32768, "num_ctx": None,
         "tier_note": "72B dense (tightest context, 32k)",
     },
-    # Third slot under trial (mixtral-8x22b dropped: no ZDR provider on OpenRouter).
-    # Both added TEMPORARILY to probe ZDR routing; keep whichever routes cleanly.
-    "gemma3-27b": {
-        "backend": "openrouter", "id": "google/gemma-3-27b-it",
-        "role": "candidate", "family": "Google", "native_ctx": 262144, "num_ctx": None,
-        "tier_note": "27B dense (below 70B tier)",
-    },
+    # Third slot: DeepSeek, chosen after a ZDR probe (all candidates routed;
+    # mixtral-8x22b had earlier been dropped for having no ZDR provider, and
+    # gemma3-27b was dropped in favor of DeepSeek for greater family distance).
+    # Included as a cross-family point ABOVE the 70B-dense tier -- see tier_note.
     "deepseek-v3.1": {
         "backend": "openrouter", "id": "deepseek/deepseek-chat-v3.1",
         "role": "candidate", "family": "DeepSeek", "native_ctx": 163840, "num_ctx": None,
-        "tier_note": "MoE 671B total / ~37B active (tier mismatch: huge total, ~37B active)",
+        "tier_note": "large MoE (671B total / ~37B active); cross-family point above "
+                     "the 70B-dense tier, not a same-tier peer",
     },
 }
 
