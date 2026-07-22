@@ -56,12 +56,15 @@ def _good_obj(present_map=None):
 
 
 def test_registry():
-    print("registry: 3 cross-family OpenRouter candidates")
-    check("exactly 3 models", len(MODELS) == 3, str(list(MODELS)))
+    print("registry: cross-family OpenRouter candidates")
+    check("2-4 models", 2 <= len(MODELS) <= 4, str(list(MODELS)))
     check("all openrouter backend", all(s["backend"] == "openrouter" for s in MODELS.values()))
     check("all candidates (no reference)", all(s["role"] == "candidate" for s in MODELS.values()))
-    check("three distinct families",
-          {s["family"] for s in MODELS.values()} == {"Meta", "Qwen", "Mistral"})
+    check("all families distinct",
+          len({s["family"] for s in MODELS.values()}) == len(MODELS))
+    check("Meta + Qwen retained",
+          {s["family"] for s in MODELS.values()} >= {"Meta", "Qwen"})
+    check("every model has a tier_note", all(s.get("tier_note") for s in MODELS.values()))
     check("ZDR provider prefs", PROVIDER_PREFS == {"data_collection": "deny",
           "allow_fallbacks": False, "zdr": True})
 
@@ -170,42 +173,74 @@ def test_runner_resume_and_stale_filter():
     try:
         docs = {"doc_a": "t", "doc_b": "t"}
         run_analyses(docs, ALL_MODELS, tmp, _fake_call_fn)
-        check("6 checkpoints (2 docs x 3 models)",
-              len(list((tmp / "analyses").glob("*.json"))) == 6)
+        check("2 docs x N models checkpoints",
+              len(list((tmp / "analyses").glob("*.json"))) == 2 * len(ALL_MODELS))
         rec = json.loads((tmp / "analyses" / f"doc_a__{STRONG}.json").read_text())
         check("checkpoint metadata present",
-              rec["ok"] and rec["prompt_version"] and rec["latency_label"] == "colab_gpu"
-              or rec["latency_label"])  # label set by caller default
+              rec["ok"] and rec["prompt_version"] and rec["latency_label"])
         calls = []
         run_analyses(docs, ALL_MODELS, tmp, lambda s, m: (calls.append(s),
                                                           _fake_call_fn(s, m))[1])
         check("resume skips completed", calls == [])
 
         # a stale de-registered-model checkpoint must be ignored downstream
-        (tmp / "analyses" / "doc_a__gemma3-12b.json").write_text(json.dumps(
-            {"doc": "doc_a", "model": "gemma3-12b", "role": "candidate",
+        (tmp / "analyses" / "doc_a__mixtral-8x22b.json").write_text(json.dumps(
+            {"doc": "doc_a", "model": "mixtral-8x22b", "role": "candidate",
              "parsed": _good_obj(), "ok": True}))
         analyses = build_blind_eval.load_analyses(tmp)
         check("stale model filtered from blind load",
-              all("gemma3-12b" not in per for per in analyses.values()))
+              all("mixtral-8x22b" not in per for per in analyses.values()))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def test_candidate_failure_aborts():
-    print("a hard call failure fails loudly (no silent leak)")
+class _StatusErr(Exception):
+    def __init__(self, status):
+        self.status_code = status
+        self.message = f"HTTP {status} no endpoints match data policy"
+        super().__init__(self.message)
+
+
+class _RaisingClient:
+    def __init__(self, exc):
+        self._exc = exc
+        self.chat = types.SimpleNamespace(
+            completions=types.SimpleNamespace(create=lambda **k: (_ for _ in ()).throw(exc)))
+
+
+def test_permanent_error_and_tolerance():
+    print("404 fails fast (no retry); tolerate_failures records per-model + continues")
+    call_fn = make_call_fn({"openrouter": _RaisingClient(_StatusErr(404))})
+    try:
+        call_fn("qwen-2.5-72b", [{"role": "user", "content": "x"}])
+        check("404 raises", False)
+    except RuntimeError as e:
+        check("404 raised immediately with no retry", "404" in str(e) and "no retry" in str(e))
+
     tmp = Path(tempfile.mkdtemp(prefix="an_"))
     try:
+        # one model always 404s; the rest succeed. tolerate -> run completes.
+        bad = [m for m in ALL_MODELS if m != STRONG][0]
         def fn(short, messages):
-            if short == "mixtral-8x22b":
-                raise RuntimeError("no ZDR provider available")
+            if short == bad:
+                raise RuntimeError(f"{MODELS[short]['id']}: HTTP 404 (no retry): data policy")
             return _fake_call_fn(short, messages)
+        run_analyses({"d1": "t"}, ALL_MODELS, tmp, fn, tolerate_failures=True)
+        recs = {p.stem.split("__")[1]: json.loads(p.read_text())
+                for p in (tmp / "analyses").glob("*.json")}
+        check("all models checkpointed under tolerance", len(recs) == len(ALL_MODELS))
+        check("404 model recorded ok:false+call_failed",
+              recs[bad]["ok"] is False and recs[bad]["call_failed"]
+              and "404" in recs[bad]["error"])
+        check("good models still ok", recs[STRONG]["ok"])
+        # WITHOUT tolerance the same failure aborts
+        shutil.rmtree(tmp / "analyses")
         raised = False
         try:
-            run_analyses({"doc_a": "t"}, ALL_MODELS, tmp, fn)
+            run_analyses({"d1": "t"}, ALL_MODELS, tmp, fn, tolerate_failures=False)
         except RuntimeError:
             raised = True
-        check("run aborts on hard failure", raised)
+        check("without tolerance the run aborts", raised)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -250,16 +285,19 @@ def test_blind_gate_and_aggregate():
             check("guardrail blocks without GT key", "GUARDRAIL" in str(e))
         _write_gt_key(tmp, docs)
         n_blind, _ = build_blind_eval.build(tmp)
-        check("blind rows = 2 docs x 3 models", n_blind == 6, str(n_blind))
+        n_models = len(ALL_MODELS)
+        check("blind rows = 2 docs x N models", n_blind == 2 * n_models, str(n_blind))
 
         blind = list(csv.DictReader(open(tmp / "blind_eval.csv")))
         key = {r["presentation_id"]: r for r in csv.DictReader(open(tmp / "unblinding_key.csv"))}
-        check("labels span A-C only",
-              {r["output_label"] for r in blind} == {"Output A", "Output B", "Output C"})
+        expected_labels = {f"Output {c}" for c in "ABCDE"[:n_models]}
+        check("labels span first N of A-E",
+              {r["output_label"] for r in blind} == expected_labels)
         check("blind hides model", all("model" not in r for r in blind))
         check("SummEval columns",
               all(c in blind[0] for c in ("coherence_1to5", "consistency_1to5",
                                           "fluency_1to5", "relevance_1to5")))
+        weak = next(m for m in ALL_MODELS if m != STRONG)
         model_of = {r["presentation_id"]: r["model"] for r in key.values()}
         for r in blind:
             base = 5 if model_of[r["presentation_id"]] == STRONG else 3
@@ -269,15 +307,15 @@ def test_blind_gate_and_aggregate():
             w = csv.DictWriter(f, fieldnames=blind[0].keys()); w.writeheader(); w.writerows(blind)
 
         rows, wins, human_filled, gt_filled, n_bl, _ = aggregate_analysis.aggregate(tmp)
-        check("all rated", human_filled == 6)
+        check("all rated", human_filled == 2 * n_models)
         by = {r["model"]: r for r in rows}
         check("SummEval means un-blinded",
-              by[STRONG]["coherence"] == 5.0 and by["qwen-2.5-72b"]["coherence"] == 3.0)
+              by[STRONG]["coherence"] == 5.0 and by[weak]["coherence"] == 3.0)
         check("strong model wins risk F1",
-              by[STRONG]["risk_f1"] == 1.0 and by["mixtral-8x22b"]["risk_f1"] < 1.0,
+              by[STRONG]["risk_f1"] == 1.0 and by[weak]["risk_f1"] < 1.0,
               str({m: by[m]["risk_f1"] for m in by}))
         check("entity F1 = 1.0 all", all(by[m]["entity_f1"] == 1.0 for m in by))
-        check("all 3 in wins (no reference excluded)", set(wins) == set(ALL_MODELS))
+        check("all models in wins", set(wins) == set(ALL_MODELS))
         check("strong wins risk_f1 on both docs", wins[STRONG]["risk_f1"] == 2)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -290,7 +328,7 @@ if __name__ == "__main__":
     test_context_check()
     test_openrouter_provider_prefs()
     test_runner_resume_and_stale_filter()
-    test_candidate_failure_aborts()
+    test_permanent_error_and_tolerance()
     test_prepare_ground_truth()
     test_blind_gate_and_aggregate()
     print(f"\nALL {PASS} CHECKS PASSED")

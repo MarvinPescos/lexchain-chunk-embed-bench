@@ -42,10 +42,17 @@ MODELS = {
         "role": "candidate", "family": "Qwen", "native_ctx": 32768, "num_ctx": None,
         "tier_note": "72B dense (tightest context, 32k)",
     },
-    "mixtral-8x22b": {
-        "backend": "openrouter", "id": "mistralai/mixtral-8x22b-instruct",
-        "role": "candidate", "family": "Mistral", "native_ctx": 65536, "num_ctx": None,
-        "tier_note": "MoE 141B total / ~39B active; ~70B-class compute, older (Apr 2024)",
+    # Third slot under trial (mixtral-8x22b dropped: no ZDR provider on OpenRouter).
+    # Both added TEMPORARILY to probe ZDR routing; keep whichever routes cleanly.
+    "gemma3-27b": {
+        "backend": "openrouter", "id": "google/gemma-3-27b-it",
+        "role": "candidate", "family": "Google", "native_ctx": 262144, "num_ctx": None,
+        "tier_note": "27B dense (below 70B tier)",
+    },
+    "deepseek-v3.1": {
+        "backend": "openrouter", "id": "deepseek/deepseek-chat-v3.1",
+        "role": "candidate", "family": "DeepSeek", "native_ctx": 163840, "num_ctx": None,
+        "tier_note": "MoE 671B total / ~37B active (tier mismatch: huge total, ~37B active)",
     },
 }
 

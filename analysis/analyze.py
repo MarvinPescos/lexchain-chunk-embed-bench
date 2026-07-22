@@ -191,6 +191,12 @@ def make_call_fn(clients: dict):
                 )
                 return resp.choices[0].message.content or "", usage_d, latency
             except Exception as e:
+                # Permanent client errors (404 no ZDR endpoint, 400/401/403) are
+                # deterministic -- don't waste backoff retries; surface at once.
+                status = getattr(e, "status_code", None)
+                if status in (400, 401, 403, 404):
+                    raise RuntimeError(f"{spec['id']}: HTTP {status} "
+                                       f"(no retry): {getattr(e, 'message', e)}") from e
                 last_err = e
                 wait = min(2 ** attempt, 30)
                 log(f"  {spec['id']}: {type(e).__name__} "
@@ -212,8 +218,13 @@ def _log_raw_failure(cache_dir: Path, stem: str, short: str, attempt: int,
 
 def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
                  call_fn, latency_label: str = "openrouter_api",
-                 resume: bool = True) -> list[Path]:
-    """Analyze each doc with each model, checkpointing every output."""
+                 resume: bool = True, tolerate_failures: bool = False) -> list[Path]:
+    """Analyze each doc with each model, checkpointing every output.
+
+    tolerate_failures: when True (model-probing / smoke), a hard call failure is
+    recorded (ok:false, call_failed:true) and the run continues to the next model
+    instead of aborting -- so a ZDR-404 model is reported per-model rather than
+    killing the whole run. Default False keeps the full run fail-loud."""
     out_dir = cache_dir / "analyses"
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -223,7 +234,7 @@ def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
         messages = build_messages(text)
         for short in short_names:
             spec = MODELS[short]
-            is_reference = spec["role"] != "candidate"
+            is_reference = spec["role"] != "candidate" or tolerate_failures
             i += 1
             path = out_dir / f"{stem}__{short}.json"
             if resume and path.exists():
@@ -271,10 +282,10 @@ def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
                 log(f"    -> {status} ({latency:.1f}s, "
                     f"{usage.get('completion_tokens', '?')} out tok)")
             except Exception as e:
-                # All three are equal candidates now: a hard failure (incl. a ZDR
-                # routing failure under allow_fallbacks:false) fails loudly rather
-                # than leaking to a non-compliant provider. (A non-"candidate"
-                # role, if ever reintroduced, would be recorded and skipped.)
+                # A hard failure (incl. a ZDR routing 404 under allow_fallbacks:
+                # false) fails loudly by default rather than leaking to a
+                # non-compliant provider. With tolerate_failures (model-probing),
+                # it is recorded per-model and the run continues.
                 if not is_reference:
                     raise
                 atomic_write_json(path, {
@@ -302,6 +313,9 @@ def main():
     ap.add_argument("--skip-context-check", action="store_true",
                     help="NOT recommended; the check prevents silent truncation")
     ap.add_argument("--skip-vram-check", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--tolerate-failures", action="store_true",
+                    help="record per-model call failures (e.g. ZDR-404) and continue "
+                         "instead of aborting -- use when probing which models route")
     args = ap.parse_args()
 
     short_names = [m.strip() for m in args.models.split(",") if m.strip()]
@@ -336,8 +350,23 @@ def main():
 
     t0 = time.time()
     run_analyses(docs, short_names, args.cache_dir, call_fn,
-                 latency_label=args.latency_label)
+                 latency_label=args.latency_label,
+                 tolerate_failures=args.tolerate_failures)
     log(f"done in {(time.time() - t0) / 60:.1f} min -> {args.cache_dir}/analyses")
+
+    # per-model status summary (ZDR routing pass/fail is visible here)
+    log("per-model status:")
+    for short in short_names:
+        recs = [json.loads(p.read_text()) for p in
+                (args.cache_dir / "analyses").glob(f"*__{short}.json")]
+        ok = sum(r.get("ok") for r in recs)
+        failed = [r for r in recs if r.get("call_failed")]
+        if failed:
+            err = failed[0].get("error", "")
+            zdr = "ZDR/data-policy 404" if "404" in err else "call failed"
+            log(f"  {short:16s} {ok}/{len(recs)} ok  --  {zdr}: {err[:90]}")
+        else:
+            log(f"  {short:16s} {ok}/{len(recs)} ok")
 
 
 if __name__ == "__main__":
