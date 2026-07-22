@@ -6,9 +6,8 @@ clause categories derived from CUAD's expert-annotated clause categories
 Review", 2021). For every category the model must state present/absent and
 quote the clause verbatim when present.
 
-The SAME prompt is sent to all 5 models (4 Ollama candidates + the NIM 70B
-reference). Do not edit without bumping PROMPT_VERSION -- results across
-versions are not comparable.
+The SAME prompt is sent to every model in the set. Do not edit without bumping
+PROMPT_VERSION -- results across versions are not comparable.
 """
 
 from __future__ import annotations

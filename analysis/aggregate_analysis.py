@@ -106,6 +106,8 @@ def aggregate(cache_dir: Path):
     analyses = defaultdict(dict)   # model -> doc -> checkpoint record
     for p in sorted((cache_dir / "analyses").glob("*.json")):
         rec = json.loads(p.read_text(encoding="utf-8"))
+        if rec["model"] not in MODELS:
+            continue  # ignore stale de-registered-model checkpoints
         analyses[rec["model"]][rec["doc"]] = rec
 
     # ---- per-(model, doc) records ----
@@ -219,15 +221,14 @@ def main():
         return d[[c for c, _ in PAPER_COLS]].rename(columns=dict(PAPER_COLS)) \
             .to_markdown(index=False, floatfmt=".3f")
 
-    latency_label = next((r["latency_label"] for r in rows if r.get("latency_label")), "gpu")
+    latency_label = next((r["latency_label"] for r in rows if r.get("latency_label")), "api")
     md_parts = [
-        f"## Candidates (self-hostable, sorted by Risk F1; latency = {latency_label})",
+        f"## Models (sorted by Risk F1; latency = {latency_label})",
         "", table(cand), "",
-        f"## Reference — {REFERENCE_ROLE}", "",
-        table(ref) if len(ref) else "_(reference model not yet run)_", "",
-        "## Per-document wins among candidates (n=10; ties count for all tied)",
-        "",
     ]
+    if len(ref):  # only shown if a non-candidate reference row exists (legacy designs)
+        md_parts += [f"## Reference — {REFERENCE_ROLE}", "", table(ref), ""]
+    md_parts += ["## Per-document wins (n=10; ties count for all tied)", ""]
     wins_rows = [{"model": m, **w} for m, w in wins.items()]
     wins_df = pd.DataFrame(wins_rows).sort_values("risk_f1", ascending=False) \
         if wins_rows else pd.DataFrame()

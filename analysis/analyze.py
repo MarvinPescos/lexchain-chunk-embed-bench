@@ -1,28 +1,26 @@
 #!/usr/bin/env python3
-"""Run the 5-model document analysis over the deterministic 10-doc Law sample.
+"""Run the 3-model document analysis over the deterministic 10-doc Law sample.
 
-Model set (see data.MODELS): 4 self-hostable Ollama candidates + the NIM-hosted
-meta/llama-3.1-70b-instruct kept only as a "reference (non-deployable)" ceiling.
-One frozen prompt (prompt.PROMPT_VERSION), temperature 0, identical schema.
+Model set (see data.MODELS): 3 ~70B-tier instruct models from different families,
+all via OpenRouter under a zero-data-retention policy (the single variable is the
+model). One frozen prompt (prompt.PROMPT_VERSION), temperature 0, identical schema.
 
-Per (document, model): call the model, strip reasoning blocks if configured,
-parse + schema-validate the JSON; on parse/validation failure retry with backoff
+Per (document, model): call the model (constrained JSON decoding + ZDR provider
+routing), parse + schema-validate; on parse/validation failure retry with backoff
 and log the raw output to <cache>/raw_failures/. Checkpoint every output to
     <cache>/analyses/{doc}__{model}.json
 (resumable: existing checkpoints are skipped). A context-safety check runs
 BEFORE any call and refuses to run if any document could be truncated.
 
-Latency is wall-clock per call and labeled (default "colab_gpu") -- CPU
-deployment latency is measured separately on the server.
+Latency is wall-clock per call and labeled (default "openrouter_api").
 
 Environment:
-  NVIDIA_API_KEY   for the NIM reference model
-  OLLAMA_BASE_URL  default http://localhost:11434/v1
+  OPENROUTER_API_KEY   required (Colab: add it as a secret)
 
 Usage:
-  python -m analysis.analyze --smoke 2                  # 2 docs x all 5 models
-  python -m analysis.analyze                            # full 10 x 5 = 50
-  python -m analysis.analyze --models llama3.1-8b,qwen3-14b
+  python -m analysis.analyze --smoke 2                  # 2 docs x all 3 models
+  python -m analysis.analyze                            # full 10 x 3 = 30
+  python -m analysis.analyze --models llama-3.3-70b,qwen-2.5-72b
 """
 
 from __future__ import annotations
@@ -32,7 +30,6 @@ import difflib
 import json
 import os
 import time
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,13 +38,14 @@ from .data import (
     EXCLUDED_MODELS,
     MAX_OUTPUT_TOKENS,
     MODELS,
+    PROVIDER_PREFS,
     context_check,
     load_docs,
     sample_stems,
 )
 from .prompt import PROMPT_VERSION, build_messages, parse_analysis, validate_schema
 
-NIM_BASE_URL = "https://integrate.api.nvidia.com/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MAX_RETRIES = 6        # transport-level (rate limit / 5xx)
 PARSE_RETRIES = 2      # additional attempts when output fails parse/schema checks
 TEMPERATURE = 0
@@ -68,22 +66,15 @@ def atomic_write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
-def ollama_base_url() -> str:
-    return os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-
-
 def get_clients(backends: set[str]) -> dict:
     from openai import OpenAI
 
     clients = {}
-    if "nim" in backends:
-        key = os.environ.get("NVIDIA_API_KEY")
+    if "openrouter" in backends:
+        key = os.environ.get("OPENROUTER_API_KEY")
         if not key:
-            raise SystemExit("NVIDIA_API_KEY not set (needed for the 70B reference; "
-                             "Colab: add it as a secret)")
-        clients["nim"] = OpenAI(base_url=NIM_BASE_URL, api_key=key)
-    if "ollama" in backends:
-        clients["ollama"] = OpenAI(base_url=ollama_base_url(), api_key="ollama")
+            raise SystemExit("OPENROUTER_API_KEY not set (Colab: add it as a secret)")
+        clients["openrouter"] = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=key)
     return clients
 
 
@@ -100,11 +91,9 @@ def validate_models(clients: dict, short_names: list[str]) -> None:
             problems.append(f"{backend}: cannot list models ({e}) -- is the endpoint up?")
             continue
         for s, mid in wanted.items():
-            # Ollama lists tags as e.g. "llama3.1:8b"; exact match expected
             if mid not in served:
                 near = difflib.get_close_matches(mid, served, n=3, cutoff=0.3)
-                hint = f"run `ollama pull {mid}`" if backend == "ollama" else f"closest: {near}"
-                problems.append(f"{backend}: '{mid}' ({s}) not served -- {hint}")
+                problems.append(f"{backend}: '{mid}' ({s}) not served -- closest: {near}")
     if problems:
         raise SystemExit("Model validation failed:\n  " + "\n  ".join(problems))
     log(f"validated {len(short_names)} models across {sorted(clients)} backends")
@@ -145,28 +134,8 @@ def assert_vram(short_names: list[str], free_gb=None) -> None:
     log(f"VRAM check OK ({free:.1f}GB free) for {[s for s, _ in needy]}")
 
 
-def ollama_model_meta(model_id: str) -> dict:
-    """Quantization/parameter metadata from Ollama's /api/show (best effort)."""
-    base = ollama_base_url().removesuffix("/v1")
-    try:
-        req = urllib.request.Request(
-            base + "/api/show",
-            data=json.dumps({"model": model_id}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as r:
-            details = json.load(r).get("details", {})
-        return {
-            "quantization": details.get("quantization_level"),
-            "parameter_size": details.get("parameter_size"),
-            "family": details.get("family"),
-        }
-    except Exception as e:
-        return {"quantization": None, "error": f"{type(e).__name__}: {e}"}
-
-
 def collect_models_meta(cache_dir: Path, short_names: list[str]) -> dict:
-    """Record exact tag, quantization, num_ctx, temperature per model."""
+    """Record exact id, family, tier, context, decoding, and privacy per model."""
     meta_path = cache_dir / "models_meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
     for s in short_names:
@@ -174,21 +143,18 @@ def collect_models_meta(cache_dir: Path, short_names: list[str]) -> dict:
         entry = {
             "id": spec["id"],
             "backend": spec["backend"],
+            "family": spec.get("family"),
             "role": spec["role"],
-            "num_ctx": spec["num_ctx"],
             "native_ctx": spec["native_ctx"],
+            "tier_note": spec.get("tier_note"),
             "temperature": TEMPERATURE,
             "max_output_tokens": MAX_OUTPUT_TOKENS,
             "prompt_version": PROMPT_VERSION,
-            "json_decoding": ("response_format=json_object (constrained)"
-                              if spec["backend"] == "ollama"
-                              else "unconstrained (prompt-only)"),
+            "json_decoding": "response_format=json_object (constrained)",
+            "privacy": dict(PROVIDER_PREFS) if spec["backend"] == "openrouter" else None,
             "recorded_at": now_iso(),
         }
-        if spec["backend"] == "ollama":
-            entry.update(ollama_model_meta(spec["id"]))
         meta[s] = entry
-    # auditable record of models screened out before the run
     meta["_excluded"] = EXCLUDED_MODELS
     atomic_write_json(meta_path, meta)
     return meta
@@ -206,18 +172,11 @@ def make_call_fn(clients: dict):
             temperature=TEMPERATURE,
             max_tokens=MAX_OUTPUT_TOKENS,
         )
-        if spec["backend"] == "ollama":
-            # constrained JSON decoding so small models emit syntactically valid
-            # JSON (fixes llama3.1:8b's dropped-"quote"-key bug at the source).
-            # Belt and suspenders: the OpenAI-standard response_format (honored by
-            # Ollama's /v1 shim) AND Ollama's native top-level format via
-            # extra_body, so the constraint applies whichever route is taken.
+        if spec["backend"] == "openrouter":
+            # constrained JSON decoding + zero-data-retention provider routing
+            # (deny data collection, no fallback to a non-compliant provider).
             kwargs["response_format"] = {"type": "json_object"}
-            extra = {"format": "json"}
-            if spec["num_ctx"]:
-                # explicit context so Ollama never silently truncates at its default
-                extra["options"] = {"num_ctx": spec["num_ctx"]}
-            kwargs["extra_body"] = extra
+            kwargs["extra_body"] = {"provider": dict(PROVIDER_PREFS)}
         last_err = None
         for attempt in range(MAX_RETRIES):
             try:
@@ -252,7 +211,7 @@ def _log_raw_failure(cache_dir: Path, stem: str, short: str, attempt: int,
 
 
 def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
-                 call_fn, latency_label: str = "colab_gpu",
+                 call_fn, latency_label: str = "openrouter_api",
                  resume: bool = True) -> list[Path]:
     """Analyze each doc with each model, checkpointing every output."""
     out_dir = cache_dir / "analyses"
@@ -312,9 +271,10 @@ def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
                 log(f"    -> {status} ({latency:.1f}s, "
                     f"{usage.get('completion_tokens', '?')} out tok)")
             except Exception as e:
-                # A candidate failing hard is a real problem -> fail loudly.
-                # The reference (non-deployable) must not abort the run: record
-                # the failure and continue with the four candidates.
+                # All three are equal candidates now: a hard failure (incl. a ZDR
+                # routing failure under allow_fallbacks:false) fails loudly rather
+                # than leaking to a non-compliant provider. (A non-"candidate"
+                # role, if ever reintroduced, would be recorded and skipped.)
                 if not is_reference:
                     raise
                 atomic_write_json(path, {
@@ -323,8 +283,8 @@ def run_analyses(docs: dict[str, str], short_names: list[str], cache_dir: Path,
                     "schema_problems": ["call failed"],
                     "latency_s": None, "usage": {},
                 })
-                log(f"    -> REFERENCE CALL FAILED ({type(e).__name__}); recorded "
-                    f"ok:false and continuing. Fix access and rerun to retry it.")
+                log(f"    -> CALL FAILED ({type(e).__name__}); recorded ok:false, "
+                    f"continuing. Fix and rerun to retry it.")
             written.append(path)
     return written
 
@@ -338,11 +298,10 @@ def main():
     ap.add_argument("--models", default=",".join(MODELS))
     ap.add_argument("--limit-docs", type=int, default=DEFAULT_SAMPLE_SIZE)
     ap.add_argument("--smoke", type=int, default=None, metavar="N")
-    ap.add_argument("--latency-label", default="colab_gpu")
+    ap.add_argument("--latency-label", default="openrouter_api")
     ap.add_argument("--skip-context-check", action="store_true",
                     help="NOT recommended; the check prevents silent truncation")
-    ap.add_argument("--skip-vram-check", action="store_true",
-                    help="NOT recommended; CPU offload wrecks the latency numbers")
+    ap.add_argument("--skip-vram-check", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     short_names = [m.strip() for m in args.models.split(",") if m.strip()]

@@ -59,12 +59,22 @@ def _fmt_risks(risk_flags: list) -> str:
 
 
 def load_analyses(cache_dir: Path) -> dict[str, dict[str, dict]]:
-    """doc -> model -> parsed analysis (from checkpoints)."""
+    """doc -> model -> parsed analysis (from checkpoints).
+
+    Ignores checkpoints for models no longer in the registry, so stale outputs
+    from a previous model set can never leak into the blind sheet."""
     out: dict[str, dict[str, dict]] = {}
+    skipped = set()
     for path in sorted((cache_dir / "analyses").glob("*.json")):
         rec = json.loads(path.read_text(encoding="utf-8"))
+        if rec["model"] not in MODELS:
+            skipped.add(rec["model"])
+            continue
         parsed = rec.get("parsed") or {"summary": "", "entities": {}, "risk_flags": []}
         out.setdefault(rec["doc"], {})[rec["model"]] = parsed
+    if skipped:
+        print(f"[build_blind_eval] ignoring checkpoints for de-registered models: "
+              f"{sorted(skipped)} (delete them to reclaim space)")
     return out
 
 
