@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Aggregate the filled blind sheet + hand-authored key into the final results.
+"""Aggregate the filled blind sheet(s) + hand-authored key into the final results.
 
 Joins (all in <cache>):
-  blind_eval.csv         filled by raters: SummEval 1-5 ratings, identities hidden
-  unblinding_key.csv     presentation_id -> model (+ role)
+  ratings                one or many raters -- blind_eval.xlsx (one sheet per
+                         rater, preferred), blind_eval_<rater>.csv files, or a
+                         single blind_eval.csv. Validated on load (1-5, no
+                         blanks, identical presentation_id sets); scores used
+                         everywhere are the MEAN across raters. See raters.py.
+  unblinding_key.csv     presentation_id -> model (+ role) + doc_reference
   analyses/*.json        each model's entities/risk checklist + latency, for F1/timing
   ground_truth_key.csv   HAND-AUTHORED true entities + risk clauses per doc
 
 Outputs:
   results.csv / results.md  final un-blinded table:
       model | coherence | consistency | fluency | relevance | entity F1 | risk F1 | mean latency
-    candidates sorted by risk F1 (desc); the 70B reference row separated and
-    labeled "reference (non-deployable)".
-  wins.csv                  per-document win counts among CANDIDATES (n=10 is too
-    small for significance tests; we report wins + means). Ties: all tied win.
+    sorted by risk F1 (desc), plus an inter-rater agreement section.
+  wins.csv                  per-document win counts (n=10 is too small for
+    significance tests; we report wins + means). Ties: all tied win.
+  agreement.csv             per-dimension inter-rater agreement: n, exact-match %,
+    within-1 %, per-rater mean/SD, Pearson r (suppressed/flagged at ceiling).
 
 Risk F1: the model's checklist categories marked present (category + quote) are
 fuzzy-matched against the key's hand-written risk_clauses -- same matcher as
@@ -36,14 +41,9 @@ import pandas as pd
 from .data import MODELS, REFERENCE_ROLE
 from .matching_entities import prf_from_counts, score_category
 from .prompt import ENTITY_CATEGORIES
+from .raters import RATING_COLS, SUMM_DIMENSIONS, agreement_stats, load_ratings
 
-RATING_COLS = {  # blind-sheet column -> short name (SummEval dimensions)
-    "coherence_1to5": "coherence",
-    "consistency_1to5": "consistency",
-    "fluency_1to5": "fluency",
-    "relevance_1to5": "relevance",
-}
-DIMENSIONS = list(RATING_COLS.values()) + ["entity_f1", "risk_f1"]
+DIMENSIONS = SUMM_DIMENSIONS + ["entity_f1", "risk_f1"]
 GT_LIST_COLS = ["parties", "dates", "monetary_amounts", "obligations", "risk_clauses"]
 
 
@@ -100,7 +100,9 @@ def aggregate(cache_dir: Path):
     if not key_rows:
         raise SystemExit(f"no unblinding_key.csv in {cache_dir} (run build_blind_eval.py)")
     key = {r["presentation_id"]: r for r in key_rows}
-    blind = load_csv(cache_dir / "blind_eval.csv")
+    # ratings: one or many raters, validated on load; scores are the per-
+    # (presentation_id, dimension) MEAN across raters
+    _per_rater, averaged, _source = load_ratings(cache_dir, valid_pids=set(key))
     gt_rows = {r["doc_reference"]: r for r in load_csv(cache_dir / "ground_truth_key.csv")}
 
     analyses = defaultdict(dict)   # model -> doc -> checkpoint record
@@ -113,18 +115,13 @@ def aggregate(cache_dir: Path):
     # ---- per-(model, doc) records ----
     per_doc: dict[tuple[str, str], dict] = {}
     human_filled = 0
-    for row in blind:
-        k = key.get(row["presentation_id"])
+    for pid, dims in averaged.items():
+        k = key.get(pid)
         if not k:
             continue
-        rec = per_doc.setdefault((k["model"], row["doc_reference"]), {})
-        got_any = False
-        for col, short in RATING_COLS.items():
-            v = _to_float(row.get(col, ""))
-            if v is not None:
-                rec[short] = v
-                got_any = True
-        human_filled += int(got_any)
+        rec = per_doc.setdefault((k["model"], k["doc_reference"]), {})
+        rec.update(dims)
+        human_filled += int(bool(dims))
 
     gt_filled = sum(1 for r in gt_rows.values()
                     if any(_split_cell(r.get(c, "")) for c in GT_LIST_COLS))
@@ -183,7 +180,7 @@ def aggregate(cache_dir: Path):
                 if v == best:
                     wins[m][dim] += 1
 
-    return rows, wins, human_filled, gt_filled, len(blind), len(gt_rows)
+    return rows, wins, human_filled, gt_filled, len(key), len(gt_rows)
 
 
 PAPER_COLS = [
@@ -233,16 +230,39 @@ def main():
     wins_df = pd.DataFrame(wins_rows).sort_values("risk_f1", ascending=False) \
         if wins_rows else pd.DataFrame()
     md_parts.append(wins_df.to_markdown(index=False) if len(wins_df) else "_(pending)_")
+
+    # ---- inter-rater agreement (only meaningful with >1 rater) ----
+    per_rater, _averaged, source = load_ratings(args.cache_dir, valid_pids=None)
+    agree_rows = agreement_stats(per_rater)
+    agree_df = pd.DataFrame(agree_rows) if agree_rows else pd.DataFrame()
+    if len(agree_df):
+        # render suppressed correlations as "n/a" rather than NaN (CSV keeps blank)
+        agree_md = agree_df.copy()
+        agree_md["pearson_r"] = agree_md["pearson_r"].map(
+            lambda v: "n/a" if pd.isna(v) else f"{v:.3f}")
+        md_parts += [
+            "", f"## Inter-rater agreement ({len(per_rater)} raters: "
+                f"{', '.join(sorted(per_rater))}; source: {source})", "",
+            agree_md.to_markdown(index=False), "",
+            "Scores used above are the **mean across raters** per "
+            "(presentation_id, dimension). Pearson r is suppressed (`None`) where a "
+            "rater's ratings have zero variance and flagged UNSTABLE where variance "
+            "is near zero — at ceiling (e.g. nearly all 5s) r is not meaningful, so "
+            "read the exact-match / within-1 agreement percentages instead.",
+        ]
     md = "\n".join(md_parts) + "\n"
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.cache_dir / "results.csv", index=False)
     if len(wins_df):
         wins_df.to_csv(args.cache_dir / "wins.csv", index=False)
+    if len(agree_df):
+        agree_df.to_csv(args.cache_dir / "agreement.csv", index=False)
     (args.cache_dir / "results.md").write_text(md, encoding="utf-8")
     print("\n" + md)
     print(f"Wrote results.csv, results.md"
-          + (", wins.csv" if len(wins_df) else "") + f" -> {args.cache_dir}")
+          + (", wins.csv" if len(wins_df) else "")
+          + (", agreement.csv" if len(agree_df) else "") + f" -> {args.cache_dir}")
 
 
 if __name__ == "__main__":

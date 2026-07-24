@@ -6,3 +6,4 @@ tabulate>=0.9
 tqdm>=4.64
 tiktoken>=0.7.0
 huggingface_hub>=0.23.0
+openpyxl>=3.1

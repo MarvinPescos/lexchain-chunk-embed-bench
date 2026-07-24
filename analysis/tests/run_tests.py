@@ -26,7 +26,7 @@ from analysis.prompt import (  # noqa: E402
 from analysis.data import MODELS, PROVIDER_PREFS, context_check  # noqa: E402
 from analysis.matching_entities import score_category  # noqa: E402
 from analysis.analyze import assert_vram, make_call_fn, run_analyses  # noqa: E402
-from analysis import aggregate_analysis, build_blind_eval, prepare_ground_truth  # noqa: E402
+from analysis import aggregate_analysis, build_blind_eval, prepare_ground_truth, raters  # noqa: E402
 
 PASS = 0
 ALL_MODELS = list(MODELS)  # 3 candidates, all OpenRouter
@@ -246,6 +246,99 @@ def test_permanent_error_and_tolerance():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _rating_rows(pids, scores):
+    """scores: dim -> value (constant) or dict pid->value."""
+    rows = []
+    for p in pids:
+        r = {"presentation_id": p}
+        for col, dim in raters.RATING_COLS.items():
+            v = scores[dim]
+            r[col] = v[p] if isinstance(v, dict) else v
+        rows.append(r)
+    return rows
+
+
+def _write_rater_csv(cache, name, rows):
+    with open(cache / f"blind_eval_{name}.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w.writeheader(); w.writerows(rows)
+
+
+def test_multirater_load_and_agreement():
+    print("multi-rater: load/validate, averaging, agreement stats")
+    tmp = Path(tempfile.mkdtemp(prefix="an_"))
+    try:
+        pids = [f"p{i}" for i in range(6)]
+        # author_1: relevance varies; author_2 differs by 1 on relevance for p0..p2
+        a1 = {"coherence": 5, "consistency": 4, "fluency": 5,
+              "relevance": {p: (3 if i < 3 else 5) for i, p in enumerate(pids)}}
+        a2 = {"coherence": 5, "consistency": 4, "fluency": 5,
+              "relevance": {p: (4 if i < 3 else 5) for i, p in enumerate(pids)}}
+        _write_rater_csv(tmp, "author_1", _rating_rows(pids, a1))
+        _write_rater_csv(tmp, "author_2", _rating_rows(pids, a2))
+
+        per_rater, averaged, source = raters.load_ratings(tmp)
+        check("two raters detected", set(per_rater) == {"author_1", "author_2"}, source)
+        check("averaged across raters (3 & 4 -> 3.5)", averaged["p0"]["relevance"] == 3.5)
+        check("identical ratings average to themselves", averaged["p0"]["coherence"] == 5.0)
+
+        stats = {r["dimension"]: r for r in raters.agreement_stats(per_rater)}
+        check("agreement covers all 4 dimensions", len(stats) == 4)
+        coh = stats["coherence"]
+        check("ceiling dim: 100% exact", coh["exact_match_pct"] == 100.0)
+        check("ceiling dim: r suppressed (zero variance)",
+              coh["pearson_r"] is None and "zero variance" in coh["r_note"])
+        rel = stats["relevance"]
+        check("varying dim: exact 50%, within-1 100%",
+              rel["exact_match_pct"] == 50.0 and rel["within1_pct"] == 100.0, str(rel))
+        check("varying dim: per-rater means reported",
+              rel["mean_author_1"] == 4.0 and rel["mean_author_2"] == 4.5, str(rel))
+        check("varying dim: r computed", rel["pearson_r"] is not None)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_multirater_validation():
+    print("multi-rater: validation failures are loud")
+    pids = [f"p{i}" for i in range(3)]
+    good = {"coherence": 5, "consistency": 4, "fluency": 5, "relevance": 4}
+
+    def expect_fail(label, mutate):
+        tmp = Path(tempfile.mkdtemp(prefix="an_"))
+        try:
+            rows1 = _rating_rows(pids, good)
+            rows2 = _rating_rows(pids, good)
+            mutate(rows1, rows2)
+            _write_rater_csv(tmp, "author_1", rows1)
+            _write_rater_csv(tmp, "author_2", rows2)
+            try:
+                raters.load_ratings(tmp)
+                check(label, False)
+            except SystemExit as e:
+                check(label, "RATING VALIDATION FAILED" in str(e))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    expect_fail("blank rating rejected",
+                lambda r1, r2: r1[0].__setitem__("coherence_1to5", ""))
+    expect_fail("out-of-range rating rejected",
+                lambda r1, r2: r1[1].__setitem__("relevance_1to5", 7))
+    expect_fail("mismatched presentation_id sets rejected",
+                lambda r1, r2: r2[0].__setitem__("presentation_id", "ZZZ"))
+
+    # unknown presentation_id vs the unblinding key
+    tmp = Path(tempfile.mkdtemp(prefix="an_"))
+    try:
+        _write_rater_csv(tmp, "author_1", _rating_rows(pids, good))
+        try:
+            raters.load_ratings(tmp, valid_pids={"p0", "p1"})  # p2 unknown
+            check("pid not in unblinding key rejected", False)
+        except SystemExit as e:
+            check("pid not in unblinding key rejected", "unblinding_key" in str(e))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_prepare_ground_truth():
     print("prepare_ground_truth: blank template + dumps")
     tmp = Path(tempfile.mkdtemp(prefix="an_"))
@@ -328,6 +421,8 @@ if __name__ == "__main__":
     test_matching()
     test_context_check()
     test_openrouter_provider_prefs()
+    test_multirater_load_and_agreement()
+    test_multirater_validation()
     test_runner_resume_and_stale_filter()
     test_permanent_error_and_tolerance()
     test_prepare_ground_truth()
